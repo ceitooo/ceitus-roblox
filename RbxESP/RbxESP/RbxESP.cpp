@@ -29,7 +29,7 @@
 #include <mutex>
 
 // ---- versión actual ----
-#define CEITUS_VERSION "1.0.1"
+#define CEITUS_VERSION "1.0.2"
 
 // ---- URLs GitHub (reemplazar USER/REPO con tu repo real) ----
 #define GITHUB_USER      "ceitooo"
@@ -278,19 +278,45 @@ float fTriggerFov  = 8.f;   // px radius para triggerbot
 float fRadarRange  = 150.f; // studs en el radar
 float fPrediction  = 0.08f; // segundos de predicción
 float fAimMaxDist       = 200.f; // distancia máxima en studs para aimbot
-bool  bAimbotTeamFilter = false; // ignorar compañeros de equipo en aimbot
-bool  bAimbotNoFov = false;      // apuntar al más cercano sin restricción de FOV
+bool  bAimbotTeamFilter = false;
+bool  bAimbotNoFov = false;
+int   iAimBone = 0; // 0=Cabeza, 1=Cuello, 2=Pecho
+bool  bPanicMode = false; // todo oculto
+int   panicKey = VK_END; // tecla pánico por defecto: END
+bool  bCrosshair = false;
+int   iCrosshairStyle = 0; // 0=Cruz, 1=Punto, 2=Cruz+Punto
+bool  bHitmarker = false;
+bool  bKillfeed  = false;
+bool  bChams     = false;
+
+// hitmarker state
+static DWORD g_hitmarkerTime = 0;
+static const DWORD HITMARKER_DURATION = 300; // ms
+
+// killfeed state
+struct KillfeedEntry { std::string name; DWORD time; };
+static std::vector<KillfeedEntry> g_killfeed;
+static const DWORD KILLFEED_DURATION = 4000; // ms
+
+// chams: track previous health to detect hits/kills
+struct PlayerHealthTrack { uintptr_t player; float lastHealth; std::string name; };
+static std::vector<PlayerHealthTrack> g_healthTrack;
+static std::mutex g_healthMtx;
 
 // ---- cache ESP: ESPScanThread actualiza, render solo lee snapshot ----
 struct CachedPlayerESP {
     Vector3     pos, headPos, feetPos;
     Vector3     bones[21];
+    Vector3     bonesPrev[21];
     bool        boneOk[21];
+    uintptr_t   bonePtrs[21];
+    uintptr_t   bonePrims[21]; // cached Primitive pointers — rarely change
     float       health, maxHealth;
     std::string name;
     COLORREF    col;
     uintptr_t   character;
-    uintptr_t   hrp; // puntero al HumanoidRootPart — para leer posicion fresca en render sin FindFirstChild
+    uintptr_t   hrp;
+    DWORD       boneUpdateTime;
 };
 static std::vector<CachedPlayerESP> g_espCache;
 static std::mutex                   g_espMtx;
@@ -343,7 +369,7 @@ uintptr_t    lastPs = 0;
 uintptr_t    g_cachedAimTarget = 0; // target actual del aimbot (para FOV dinámico)
 
 // radar: lista de entradas para dibujar (llenada en ESP loop, leída en render)
-struct RadarEntry { float dx, dz; COLORREF col; };
+struct RadarEntry { float dx, dz; COLORREF col; std::string name; float dist; };
 static std::vector<RadarEntry> g_radarEntries;
 static Vector3 g_localPos{};
 static int64_t  g_placeId = 0;       // PlaceId del juego actual
@@ -386,9 +412,14 @@ HWND FindRobloxWindow() {
 
 static void BoneLine(const ViewMatrix_t& vm, Vector3 a, Vector3 b,
                      float sw, float sh, COLORREF col) {
+    // skip si alguna posición es inválida (hueso no encontrado)
+    if (a.x == 0.f && a.y == 0.f && a.z == 0.f) return;
+    if (b.x == 0.f && b.y == 0.f && b.z == 0.f) return;
     Vector2 sa, sb;
-    if (WorldToScreen(vm, a, sa, sw, sh) && WorldToScreen(vm, b, sb, sw, sh))
+    if (WorldToScreen(vm, a, sa, sw, sh) && WorldToScreen(vm, b, sb, sw, sh)) {
+        DrawLine(sa, sb, RGB(0,0,0), 4);
         DrawLine(sa, sb, col, 2);
+    }
 }
 
 // Skeleton estilo stickman: círculo para la cabeza + líneas de huesos
@@ -480,6 +511,8 @@ static void AimbotThread() {
     uintptr_t cachedHeadPart = 0;
     uintptr_t cachedHRP      = 0;
     uintptr_t cachedChar     = 0;
+    uintptr_t cachedUpperTorso = 0;
+    uintptr_t cachedNeck     = 0; // simulated: between head and torso
     float     lockedHRPY    = 0.f;
     DWORD     lastScanTime   = 0;
     bool      hasSmooth      = false;
@@ -556,6 +589,7 @@ static void AimbotThread() {
             if (charChanged || dead) {
                 if (cachedPlayer) { lastDeadPlayer = cachedPlayer; lastDeadTime = GetTickCount(); }
                 cachedPlayer = 0; cachedHeadPart = 0; cachedHRP = 0; cachedChar = 0;
+                cachedUpperTorso = 0;
                 g_cachedAimTarget = 0; lastHeadTime = 0; headVel = {}; lockedHRPY = 0.f;
             }
         }
@@ -650,6 +684,8 @@ static void AimbotThread() {
             if (newPlayer) {
                 cachedPlayer = newPlayer; cachedHeadPart = newHP; cachedHRP = newHRP;
                 cachedChar = mem.Read<uintptr_t>(newPlayer + Offsets::Player::ModelInstance);
+                cachedUpperTorso = cachedChar ? FindFirstChild(cachedChar, "UpperTorso") : 0;
+                if (!cachedUpperTorso && cachedChar) cachedUpperTorso = FindFirstChild(cachedChar, "Torso");
                 lastHeadTime = 0; headVel = {};
                 // guardar Y del HRP para detectar si lo envían al spawn
                 lockedHRPY = newHRP ? GetPartPosition(newHRP).y
@@ -662,9 +698,28 @@ static void AimbotThread() {
         if (!cachedPlayer || !targetValid) continue; // no mover mouse si está fuera del FOV
 
         Vector3 headW{};
-        if (cachedHeadPart) { headW = GetPartPosition(cachedHeadPart); headW.y += 0.3f; }
-        else if (cachedHRP) { headW = GetPartPosition(cachedHRP); headW.y += 2.8f; }
-        else continue;
+        if (iAimBone == 0) {
+            // Cabeza
+            if (cachedHeadPart) { headW = GetPartPosition(cachedHeadPart); headW.y += 0.3f; }
+            else if (cachedHRP) { headW = GetPartPosition(cachedHRP); headW.y += 2.8f; }
+            else continue;
+        } else if (iAimBone == 1) {
+            // Cuello (entre cabeza y torso)
+            Vector3 hPos{}, tPos{};
+            bool hOk = false, tOk = false;
+            if (cachedHeadPart) { hPos = GetPartPosition(cachedHeadPart); hOk = true; }
+            if (cachedUpperTorso) { tPos = GetPartPosition(cachedUpperTorso); tOk = true; }
+            else if (cachedHRP) { tPos = GetPartPosition(cachedHRP); tOk = true; }
+            if (hOk && tOk) { headW = { (hPos.x+tPos.x)*0.5f, (hPos.y+tPos.y)*0.5f, (hPos.z+tPos.z)*0.5f }; }
+            else if (hOk) { headW = hPos; }
+            else if (cachedHRP) { headW = GetPartPosition(cachedHRP); headW.y += 2.0f; }
+            else continue;
+        } else {
+            // Pecho
+            if (cachedUpperTorso) { headW = GetPartPosition(cachedUpperTorso); }
+            else if (cachedHRP) { headW = GetPartPosition(cachedHRP); headW.y += 1.0f; }
+            else continue;
+        }
         if (fabsf(headW.y) > 1000000.f) continue;
 
         // ---- predicción de movimiento ----
@@ -738,9 +793,8 @@ static void ESPScanThread() {
         "RightUpperLeg","RightLowerLeg","RightFoot",
         "Torso","Left Arm","Right Arm","Left Leg","Right Leg",
     };
-    DWORD boneTickLast = 0;
     while (true) {
-        Sleep(8); // ~120Hz
+        Sleep(16); // ~60Hz
         if (!bESP) {
             std::lock_guard<std::mutex> lk(g_espMtx);
             g_espCache.clear();
@@ -748,7 +802,8 @@ static void ESPScanThread() {
         }
         uintptr_t dm = GetDataModel();
         uintptr_t ps = dm ? GetPlayersService(dm) : 0;
-        if (!ps) ps = lastPs;
+        if (ps) lastPs = ps;
+        else ps = lastPs;
         if (!ps) { std::lock_guard<std::mutex> lk(g_espMtx); g_espCache.clear(); continue; }
         uintptr_t lp = GetLocalPlayer(ps);
         g_cachedLp = lp;
@@ -769,19 +824,26 @@ static void ESPScanThread() {
         }
         g_cachedLocalPosESP = localPos;
 
+        static DWORD lastBoneScan = 0;
         DWORD now = GetTickCount();
-        bool doBonesThisTick = bSkeleton && (now - boneTickLast >= 16); // ~60Hz
-        if (doBonesThisTick) boneTickLast = now;
+        bool doBoneLookup = bSkeleton && (now - lastBoneScan > 100);
+        if (doBoneLookup) lastBoneScan = now;
 
         auto allP = GetAllPlayers(ps);
         std::vector<CachedPlayerESP> newCache;
         newCache.reserve(allP.size());
 
-        // copiar huesos viejos para los ticks sin bone-scan
         std::vector<CachedPlayerESP> oldSnap;
-        if (!doBonesThisTick) {
-            std::lock_guard<std::mutex> lk(g_espMtx);
-            oldSnap = g_espCache;
+        { std::lock_guard<std::mutex> lk(g_espMtx); oldSnap = g_espCache; }
+
+        // detectar si hay más de 1 team (si solo hay 1, es lobby → no filtrar)
+        bool multiTeam = false;
+        if (bTeamFilter && localTeam > 0x10000000000ULL) {
+            for (uintptr_t p : allP) {
+                if (p == lp) continue;
+                uintptr_t t = mem.Read<uintptr_t>(p + Offsets::Player::Team);
+                if (t > 0x10000000000ULL && t != localTeam) { multiTeam = true; break; }
+            }
         }
 
         for (uintptr_t player : allP) {
@@ -790,7 +852,7 @@ static void ESPScanThread() {
             if (!pi.valid || fabsf(pi.pos.y) > 1000000.f) continue;
             uintptr_t pTeam = mem.Read<uintptr_t>(player + Offsets::Player::Team);
             bool isTeammate = (localTeam > 0x10000000000ULL && pTeam > 0x10000000000ULL && pTeam == localTeam);
-            if (bTeamFilter && isTeammate) continue;
+            if (bTeamFilter && multiTeam && isTeammate) continue;
 
             CachedPlayerESP ce{};
             ce.pos       = pi.pos;
@@ -813,29 +875,140 @@ static void ESPScanThread() {
             } else if (isTeammate) { col = RGB(50,150,255); } else { col = RGB(50,220,50); }
             ce.col = GetESPColor(col, espColorMode);
 
-            if (doBonesThisTick && pi.character) {
+            // copiar datos de huesos del snapshot anterior
+            for (auto& old : oldSnap) {
+                if (old.character == ce.character) {
+                    memcpy(ce.bonePtrs, old.bonePtrs, sizeof(ce.bonePtrs));
+                    memcpy(ce.bonePrims, old.bonePrims, sizeof(ce.bonePrims));
+                    memcpy(ce.boneOk, old.boneOk, sizeof(ce.boneOk));
+                    memcpy(ce.bones, old.bones, sizeof(ce.bones));
+                    memcpy(ce.bonesPrev, old.bonesPrev, sizeof(ce.bonesPrev));
+                    ce.boneUpdateTime = old.boneUpdateTime;
+                    break;
+                }
+            }
+            // FindFirstChild + cache Primitive pointers cada ~500ms
+            if (doBoneLookup && bSkeleton && pi.character) {
                 for (int i = 0; i < 21; i++) {
                     uintptr_t part = FindFirstChild(pi.character, boneNames[i]);
-                    if (part) { ce.bones[i] = GetPartPosition(part); ce.boneOk[i] = true; }
+                    if (part) {
+                        ce.bonePtrs[i] = part;
+                        ce.bonePrims[i] = mem.Read<uintptr_t>(part + Offsets::BasePart::Primitive);
+                        ce.boneOk[i] = true;
+                    }
                 }
-            } else {
+            }
+            // Primitive pointers se refrescan en FindFirstChild (cada 100ms)
+            // posiciones frescas se leen en el render
+            newCache.push_back(std::move(ce));
+        }
+        // detectar hits y kills comparando health con snapshot anterior
+        if (bHitmarker || bKillfeed) {
+            for (auto& ce : newCache) {
                 for (auto& old : oldSnap) {
-                    if (old.character == ce.character) {
-                        memcpy(ce.bones, old.bones, sizeof(ce.bones));
-                        memcpy(ce.boneOk, old.boneOk, sizeof(ce.boneOk));
+                    if (old.character == ce.character && old.health > 0.f) {
+                        if (ce.health < old.health && ce.health >= 0.f) {
+                            if (bHitmarker) g_hitmarkerTime = GetTickCount();
+                            if (bKillfeed && ce.health <= 0.f) {
+                                g_killfeed.push_back({ ce.name, GetTickCount() });
+                            }
+                        }
                         break;
                     }
                 }
             }
-            newCache.push_back(std::move(ce));
+            // detectar kills: jugador que estaba en oldSnap pero no en newCache
+            if (bKillfeed) {
+                for (auto& old : oldSnap) {
+                    if (old.health <= 0.f) continue;
+                    bool found = false;
+                    for (auto& ce : newCache) {
+                        if (ce.character == old.character) { found = true; break; }
+                    }
+                    if (!found) {
+                        g_killfeed.push_back({ old.name, GetTickCount() });
+                    }
+                }
+            }
         }
-        std::lock_guard<std::mutex> lk(g_espMtx);
-        g_espCache = std::move(newCache);
+        { std::lock_guard<std::mutex> lk(g_espMtx); g_espCache = std::move(newCache); }
+
+        // debug info — actualizado desde scan thread, render solo lee
+        dbgDM = (dm != 0); dbgDMAddr = dm;
+        dbgPS = (ps != 0); dbgPSAddr = ps;
+        dbgPSChildren = (int)allP.size();
+        dbgPlayers = (int)allP.size();
+        if (dm) g_placeId = mem.Read<int64_t>(dm + Offsets::DataModel::PlaceId);
+        g_localPos = localPos;
+
+        // re-attach si DM falla >1s (teleport detection)
+        static DWORD dmFailSince = 0;
+        if (!dm) {
+            if (!dmFailSince) dmFailSince = GetTickCount();
+            else if (GetTickCount() - dmFailSince > 1000) {
+                if (mem.Attach(L"RobloxPlayerBeta.exe")) { lastPs = 0; dmFailSince = 0; }
+            }
+        } else { dmFailSince = 0; }
+
+        // anti-flash / anti-smoke — runs at scan rate, NOT per render frame
+        if (bAntiFlash || bAntiSmoke) {
+            static const uintptr_t transpOffsets[] = { 0x174, 0x188, 0x19C, 0x1B0, 0x1C4 };
+            if (bAntiFlash && lp) {
+                uintptr_t pgui = FindFirstChild(lp, "PlayerGui");
+                if (pgui) {
+                    std::function<void(uintptr_t,int)> scanFlash = [&](uintptr_t node, int d) {
+                        if (d > 4) return;
+                        for (uintptr_t ch : GetChildren(node)) {
+                            for (uintptr_t off : transpOffsets) {
+                                float val = mem.Read<float>(ch + off);
+                                if (val >= 0.f && val < 0.7f) { float one=1.f; WriteProcessMemory(mem.proc,(LPVOID)(ch+off),&one,4,nullptr); }
+                            }
+                            scanFlash(ch, d+1);
+                        }
+                    };
+                    scanFlash(pgui, 0);
+                }
+            }
+            if (bAntiSmoke && dm) {
+                uintptr_t ws = FindFirstChild(dm, "Workspace");
+                if (ws) {
+                    std::function<void(uintptr_t,int)> scanSmoke = [&](uintptr_t node, int d) {
+                        if (d > 6) return;
+                        std::string n = GetInstanceName(node);
+                        if (n == "SmokeEmitter" || n == "Smoke" || n == "SmokeParticle") { uint8_t zero=0; WriteProcessMemory(mem.proc,(LPVOID)(node+0x188),&zero,1,nullptr); }
+                        for (uintptr_t ch : GetChildren(node)) scanSmoke(ch, d+1);
+                    };
+                    scanSmoke(ws, 0);
+                }
+            }
+        }
     }
 }
 
 static const char* CFG_GLOBAL = "ceitus.cfg";
 static const char* CFG_PER_MODE[] = { "ceitus_general.cfg", "ceitus_counterblox.cfg", "ceitus_duels.cfg", "ceitus_arsenal.cfg", "ceitus_rivals.cfg" };
+
+static const char* VKName(int vk) {
+    switch(vk) {
+        case VK_INSERT: return "INSERT"; case VK_DELETE: return "DELETE";
+        case VK_HOME:   return "HOME";   case VK_END:    return "END";
+        case VK_PAUSE:  return "PAUSE";  case VK_NEXT:   return "PAGE DN";
+        case VK_PRIOR:  return "PAGE UP";
+        case VK_F1: return "F1"; case VK_F2: return "F2"; case VK_F3: return "F3";
+        case VK_F4: return "F4"; case VK_F5: return "F5"; case VK_F6: return "F6";
+        case VK_F7: return "F7"; case VK_F8: return "F8"; case VK_F9: return "F9";
+        case VK_F10: return "F10"; case VK_F11: return "F11"; case VK_F12: return "F12";
+        case VK_LBUTTON: return "MOUSE1"; case VK_RBUTTON: return "MOUSE2";
+        case VK_MBUTTON: return "MOUSE3"; case VK_XBUTTON1: return "MOUSE4";
+        case VK_XBUTTON2: return "MOUSE5"; case VK_SPACE: return "SPACE";
+        case VK_SHIFT: return "SHIFT"; case VK_CONTROL: return "CTRL";
+        case VK_MENU: return "ALT"; case VK_CAPITAL: return "CAPS";
+        default:
+            if (vk >= '0' && vk <= '9') { static char b[2]; b[0]=(char)vk; b[1]=0; return b; }
+            if (vk >= 'A' && vk <= 'Z') { static char b[2]; b[0]=(char)vk; b[1]=0; return b; }
+            static char hex[8]; snprintf(hex, sizeof(hex), "0x%02X", vk); return hex;
+    }
+}
 
 static void SaveConfig(int mode = -1) {
     // guarda siempre el modo actual en el archivo global
@@ -856,7 +1029,11 @@ static void SaveConfig(int mode = -1) {
       << fAimMaxDist << "\n" << bAimbotTeamFilter << "\n"
       << menuKey << "\n"
       << bAntiFlash << "\n" << bAntiSmoke << "\n"
-      << bAimbotNoFov << "\n" << espColorMode << "\n";
+      << bAimbotNoFov << "\n" << espColorMode << "\n"
+      << iAimBone << "\n"
+      << bCrosshair << "\n" << iCrosshairStyle << "\n"
+      << bHitmarker << "\n" << bKillfeed << "\n" << bChams << "\n"
+      << panicKey << "\n";
 }
 
 static void LoadConfig(int mode = -1) {
@@ -879,6 +1056,14 @@ static void LoadConfig(int mode = -1) {
       >> bAntiFlash >> bAntiSmoke;
     if (!f.eof()) f >> bAimbotNoFov;
     if (!f.eof()) f >> espColorMode;
+    if (!f.eof()) f >> iAimBone;
+    if (iAimBone < 0 || iAimBone > 2) iAimBone = 0;
+    if (!f.eof()) f >> bCrosshair;
+    if (!f.eof()) f >> iCrosshairStyle;
+    if (!f.eof()) f >> bHitmarker;
+    if (!f.eof()) f >> bKillfeed;
+    if (!f.eof()) f >> bChams;
+    if (!f.eof()) f >> panicKey;
     // clamp para evitar valores absurdos de configs viejas
     if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
     if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
@@ -931,9 +1116,21 @@ int main() {
 
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc = WndProc; wc.lpszClassName = L"RbxMenu"; wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassExW(&wc);
     HWND menuWnd = CreateWindowExW(WS_EX_TOPMOST, L"RbxMenu", L"ceitus",
-        WS_OVERLAPPEDWINDOW, 50, 50, 500, 780, nullptr, nullptr, wc.hInstance, nullptr);
+        WS_POPUP | WS_VISIBLE | WS_SYSMENU | WS_MINIMIZEBOX,
+        80, 40, 520, 820, nullptr, nullptr, wc.hInstance, nullptr);
+    // rounded corners on Windows 11
+    {
+        typedef HRESULT(WINAPI* pDwmSetWindowAttribute)(HWND,DWORD,LPCVOID,DWORD);
+        HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
+        if (hDwm) {
+            auto fn = (pDwmSetWindowAttribute)GetProcAddress(hDwm,"DwmSetWindowAttribute");
+            if (fn) { DWORD val = 2; fn(menuWnd, 33/*DWMWA_WINDOW_CORNER_PREFERENCE*/, &val, sizeof(val)); }
+            FreeLibrary(hDwm);
+        }
+    }
     ShowWindow(menuWnd, SW_SHOW);
 
     DXGI_SWAP_CHAIN_DESC sd{};
@@ -952,9 +1149,14 @@ int main() {
     ImGuiIO& io2 = ImGui::GetIO();
     io2.IniFilename = nullptr;
     io2.Fonts->AddFontDefault();
-    // escala global de la UI
-    ImGui::GetStyle().ScaleAllSizes(1.4f);
-    io2.FontGlobalScale = 1.4f;
+    ImGui::GetStyle().ScaleAllSizes(1.35f);
+    io2.FontGlobalScale = 1.35f;
+
+    // dragging support for borderless window
+    static HWND s_menuWnd = menuWnd;
+    static bool s_dragging = false;
+    static POINT s_dragStart{};
+
     ImGui_ImplWin32_Init(menuWnd);
     ImGui_ImplDX11_Init(g_dev, g_ctx);
 
@@ -976,60 +1178,39 @@ int main() {
             lastMenuKey = curMenuKey;
         }
 
+        // panic key: ocultar/mostrar todo
+        {
+            static bool lastPanicKey = false;
+            bool curPanic = (GetAsyncKeyState(panicKey) & 0x8000) != 0;
+            if (curPanic && !lastPanicKey) {
+                bPanicMode = !bPanicMode;
+                if (bPanicMode) {
+                    ShowWindow(menuWnd, SW_HIDE);
+                    if (g_overlay) ShowWindow(g_overlay, SW_HIDE);
+                } else {
+                    ShowWindow(menuWnd, SW_SHOW);
+                    if (g_overlay) ShowWindow(g_overlay, SW_SHOW);
+                }
+            }
+            lastPanicKey = curPanic;
+        }
+        if (bPanicMode) {
+            g_chain->Present(0, 0); Sleep(16);
+            continue;
+        }
+
         if (rbxWnd) {
             UpdateOverlayPos(rbxWnd);
-            // forzar overlay siempre encima (por si Roblox lo tapa)
-            if (g_overlay) SetWindowPos(g_overlay, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
+        if (g_overlay) SetWindowPos(g_overlay, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         ClearOverlay();
 
-        static DWORD dmFailSince = 0;
+        // debug info — sin RPM, solo lee variables atómicas/cacheadas
         {
-            uintptr_t dm = GetDataModel();
-            // si DM falla 3 segundos seguidos → re-attach al proceso nuevo (teleport)
-            if (!dm) {
-                if (!dmFailSince) dmFailSince = GetTickCount();
-                else if (GetTickCount() - dmFailSince > 1000) {
-                    if (mem.Attach(L"RobloxPlayerBeta.exe")) {
-                        lastPs = 0; dmFailSince = 0;
-                    }
-                }
-            } else { dmFailSince = 0; }
-            uintptr_t ps = dm ? GetPlayersService(dm) : 0;
-            if (ps) {
-                lastPs = ps;
-            } else if (lastPs) {
-                // validar que lastPs sigue siendo un Players service real
-                auto test = GetAllPlayers(lastPs);
-                if (test.empty()) lastPs = 0; // stale, descartar
-                ps = lastPs;
-            }
-            dbgDM = (dm != 0); dbgDMAddr = dm;
-            dbgPS = (ps != 0); dbgPSAddr = ps;
-            // leer PlaceId para auto-detección de modo
-            if (dm) g_placeId = mem.Read<int64_t>(dm + Offsets::DataModel::PlaceId);
-            if (ps) dbgPSChildren = (int)GetAllPlayers(ps).size(); else dbgPSChildren = 0;
             float vmSum = 0.f;
             for (int r=0;r<4;r++) for (int c=0;c<4;c++) vmSum += fabsf(lastVm.m[r][c]);
             dbgVmSum = vmSum;
-            if (ps) {
-                auto allP = GetAllPlayers(ps);
-                dbgPlayers = (int)allP.size();
-                // actualizar posición local siempre (para filtro de distancia del aimbot)
-                uintptr_t lp = GetLocalPlayer(ps);
-                if (lp) {
-                    uintptr_t lchar = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
-                    if (lchar) {
-                        uintptr_t lhum = FindFirstChild(lchar, "Humanoid");
-                        if (lhum) {
-                            uintptr_t lhrp = mem.Read<uintptr_t>(lhum + Offsets::Humanoid::HumanoidRootPart);
-                            if (!lhrp) lhrp = FindFirstChild(lchar, "HumanoidRootPart");
-                            if (lhrp) g_localPos = GetPartPosition(lhrp);
-                        }
-                    }
-                }
-            }
         }
         if (bESP) {
             float sw = (float)g_width;
@@ -1040,55 +1221,18 @@ int main() {
             dbgValid = 0;
             g_radarEntries.clear();
 
-            // anti-flash/anti-smoke usa punteros cacheados — sin RPM extra en render
-            if (bAntiFlash || bAntiSmoke) {
-                static const uintptr_t transpOffsets[] = { 0x174, 0x188, 0x19C, 0x1B0, 0x1C4 };
-                uintptr_t lp = g_cachedLp;
-                uintptr_t dm = g_cachedDm;
-                if (bAntiFlash && lp) {
-                    uintptr_t pgui = FindFirstChild(lp, "PlayerGui");
-                    if (pgui) {
-                        std::function<void(uintptr_t,int)> scanFlash = [&](uintptr_t node, int d) {
-                            if (d > 4) return;
-                            for (uintptr_t ch : GetChildren(node)) {
-                                for (uintptr_t off : transpOffsets) {
-                                    float val = mem.Read<float>(ch + off);
-                                    if (val >= 0.f && val < 0.7f) { float one=1.f; WriteProcessMemory(mem.proc,(LPVOID)(ch+off),&one,4,nullptr); }
-                                }
-                                scanFlash(ch, d+1);
-                            }
-                        };
-                        scanFlash(pgui, 0);
-                    }
-                }
-                if (bAntiSmoke && dm) {
-                    uintptr_t ws = FindFirstChild(dm, "Workspace");
-                    if (ws) {
-                        std::function<void(uintptr_t,int)> scanSmoke = [&](uintptr_t node, int d) {
-                            if (d > 6) return;
-                            std::string n = GetInstanceName(node);
-                            if (n == "SmokeEmitter" || n == "Smoke" || n == "SmokeParticle") { uint8_t zero=0; WriteProcessMemory(mem.proc,(LPVOID)(node+0x188),&zero,1,nullptr); }
-                            for (uintptr_t ch : GetChildren(node)) scanSmoke(ch, d+1);
-                        };
-                        scanSmoke(ws, 0);
-                    }
-                }
-            }
-
-            // snapshot del cache — posición se lee fresca desde HRP cada frame (2 RPM), sin FindFirstChild
             std::vector<CachedPlayerESP> snap;
             { std::lock_guard<std::mutex> lk(g_espMtx); snap = g_espCache; }
 
+
             for (auto& ce : snap) {
-                // leer posición fresca desde HRP cacheado — 2 RPM, sin FindFirstChild
+                // posición fresca desde HRP cacheado — 2 RPM rápidos, sin FindFirstChild
                 Vector3 pos = ce.pos;
                 if (ce.hrp) {
                     uintptr_t prim = mem.Read<uintptr_t>(ce.hrp + Offsets::BasePart::Primitive);
-                    // validar que el primitive es un puntero Roblox real; si es basura → stale
                     if (prim > 0x10000000000ULL) {
                         Vector3 fp = mem.Read<Vector3>(prim + Offsets::Primitive::Position);
-                        if (fabsf(fp.y) < 100000.f)
-                            pos = fp;
+                        if (fabsf(fp.y) < 100000.f) pos = fp;
                     }
                 }
                 Vector3 headPos = pos; headPos.y += 3.0f;
@@ -1100,8 +1244,9 @@ int main() {
                 }
 
                 if (bRadar) {
-                    RadarEntry re; re.dx = pos.x - localPos.x; re.dz = pos.z - localPos.z; re.col = ce.col;
-                    g_radarEntries.push_back(re);
+                    float rdx = pos.x - localPos.x, rdz = pos.z - localPos.z;
+                    float dist = sqrtf(rdx*rdx + rdz*rdz);
+                    g_radarEntries.push_back({ rdx, rdz, ce.col, ce.name, dist });
                 }
 
                 Vector2 headSc, feetSc, centerSc;
@@ -1111,25 +1256,62 @@ int main() {
                 if (!headFront && !feetFront) continue;
 
                 if (bSkeleton) {
-                    BoneLine(vm, ce.bones[0], ce.bones[1], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[1], ce.bones[2], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[1], ce.bones[4], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[4], ce.bones[5], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[5], ce.bones[6], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[1], ce.bones[7], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[7], ce.bones[8], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[8], ce.bones[9], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[2], ce.bones[10], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[10], ce.bones[11], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[11], ce.bones[12], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[2], ce.bones[13], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[13], ce.bones[14], sw, sh, ce.col);
-                    BoneLine(vm, ce.bones[14], ce.bones[15], sw, sh, ce.col);
+                    // leer posiciones frescas usando bonePtrs (2 RPM por hueso: part→Prim→Pos)
+                    for (int bi = 0; bi < 21; bi++) {
+                        if (ce.boneOk[bi] && ce.bonePtrs[bi]) {
+                            ce.bones[bi] = GetPartPosition(ce.bonePtrs[bi]);
+                        }
+                    }
+                    // --- stickman style ---
+                    // spine (más grueso)
+                    BoneLine(vm, ce.bones[0], ce.bones[1], sw, sh, ce.col);  // head→upper torso
+                    BoneLine(vm, ce.bones[1], ce.bones[2], sw, sh, ce.col);  // upper→lower torso
+                    // brazos
+                    BoneLine(vm, ce.bones[1], ce.bones[4], sw, sh, ce.col);  // shoulder L
+                    BoneLine(vm, ce.bones[4], ce.bones[5], sw, sh, ce.col);  // upper arm L
+                    BoneLine(vm, ce.bones[5], ce.bones[6], sw, sh, ce.col);  // lower arm L
+                    BoneLine(vm, ce.bones[1], ce.bones[7], sw, sh, ce.col);  // shoulder R
+                    BoneLine(vm, ce.bones[7], ce.bones[8], sw, sh, ce.col);  // upper arm R
+                    BoneLine(vm, ce.bones[8], ce.bones[9], sw, sh, ce.col);  // lower arm R
+                    // piernas
+                    BoneLine(vm, ce.bones[2], ce.bones[10], sw, sh, ce.col); // hip L
+                    BoneLine(vm, ce.bones[10], ce.bones[11], sw, sh, ce.col);// upper leg L
+                    BoneLine(vm, ce.bones[11], ce.bones[12], sw, sh, ce.col);// lower leg L
+                    BoneLine(vm, ce.bones[2], ce.bones[13], sw, sh, ce.col); // hip R
+                    BoneLine(vm, ce.bones[13], ce.bones[14], sw, sh, ce.col);// upper leg R
+                    BoneLine(vm, ce.bones[14], ce.bones[15], sw, sh, ce.col);// lower leg R
+                    // R6 fallback
                     BoneLine(vm, ce.bones[0], ce.bones[16], sw, sh, ce.col);
                     BoneLine(vm, ce.bones[16], ce.bones[17], sw, sh, ce.col);
                     BoneLine(vm, ce.bones[16], ce.bones[18], sw, sh, ce.col);
                     BoneLine(vm, ce.bones[16], ce.bones[19], sw, sh, ce.col);
                     BoneLine(vm, ce.bones[16], ce.bones[20], sw, sh, ce.col);
+
+                    // cabeza: círculo estilo stickman
+                    Vector2 headScBone;
+                    if (ce.boneOk[0] && !(ce.bones[0].x == 0.f && ce.bones[0].y == 0.f && ce.bones[0].z == 0.f)) {
+                        Vector3 headTop = ce.bones[0]; headTop.y += 0.6f;
+                        Vector2 htSc;
+                        if (WorldToScreen(vm, ce.bones[0], headScBone, sw, sh) &&
+                            WorldToScreen(vm, headTop, htSc, sw, sh)) {
+                            float headR = fabsf(headScBone.y - htSc.y);
+                            if (headR < 2.f) headR = 2.f;
+                            if (headR > 40.f) headR = 40.f;
+                            // outline negro
+                            DrawEllipse(headScBone, headR + 1.f, headR + 1.f, RGB(0, 0, 0));
+                            // círculo color
+                            DrawEllipse(headScBone, headR, headR, ce.col);
+                        }
+                    }
+
+                    // dots en articulaciones (hombros, codos, rodillas, caderas)
+                    static const int jointIdx[] = {1, 2, 4, 5, 7, 8, 10, 11, 13, 14};
+                    for (int ji : jointIdx) {
+                        Vector2 js;
+                        if (ce.boneOk[ji] && !(ce.bones[ji].x == 0.f && ce.bones[ji].y == 0.f && ce.bones[ji].z == 0.f)
+                            && WorldToScreen(vm, ce.bones[ji], js, sw, sh))
+                            DrawDot(js, 2, ce.col);
+                    }
                 }
 
                 if (!headFront && feetFront) headSc = { feetSc.x, feetSc.y - 80.f };
@@ -1144,6 +1326,27 @@ int main() {
                     Vector2 tl    = { midX - boxW * 0.5f, topY };
 
                     if (visH >= 2.f) {
+                        // chams: glow outline grueso alrededor del jugador
+                        if (bChams) {
+                            COLORREF glowCol = ce.col;
+                            // outline glow exterior
+                            HPEN glowPen = GetCachedPen(glowCol, 3);
+                            HPEN oldPen = (HPEN)SelectObject(g_memDC, glowPen);
+                            HBRUSH oldBr = (HBRUSH)SelectObject(g_memDC, GetStockObject(NULL_BRUSH));
+                            float pad = 4.f;
+                            ::Rectangle(g_memDC, (int)(tl.x-pad), (int)(tl.y-pad),
+                                (int)(tl.x+boxW+pad), (int)(tl.y+visH+pad));
+                            SelectObject(g_memDC, oldPen);
+                            SelectObject(g_memDC, oldBr);
+                            // relleno semi-opaco (GDI no tiene alpha, usamos líneas horizontales espaciadas)
+                            HPEN fillPen = GetCachedPen(glowCol, 1);
+                            oldPen = (HPEN)SelectObject(g_memDC, fillPen);
+                            for (float fy = tl.y; fy < tl.y + visH; fy += 3.f) {
+                                MoveToEx(g_memDC, (int)tl.x, (int)fy, nullptr);
+                                LineTo(g_memDC, (int)(tl.x + boxW), (int)fy);
+                            }
+                            SelectObject(g_memDC, oldPen);
+                        }
                         if (bBoxes) DrawBox(tl, boxW, visH, ce.col);
                         if (bHealthBar) {
                             float maxHp = ce.maxHealth > 0.f ? ce.maxHealth : 100.f;
@@ -1184,24 +1387,120 @@ int main() {
                 DrawEllipse({sw * 0.5f, sh * 0.5f}, fAimFov, fAimFov, fovCol);
             }
 
-            // ---- radar ----
+            // ---- radar mejorado ----
             if (bRadar) {
-                float rr  = 100.f;
-                float rcx = sw - rr - 15.f;
-                float rcy = sh - rr - 15.f;
+                float rr  = 110.f;
+                float rcx = sw - rr - 20.f;
+                float rcy = sh - rr - 20.f;
+
+                // fondo con borde
                 DrawFilledCircleBG({rcx, rcy}, rr);
+
+                // anillos de distancia (25%, 50%, 75%)
+                for (float frac : {0.25f, 0.5f, 0.75f})
+                    DrawEllipse({rcx, rcy}, rr*frac, rr*frac, RGB(35,35,55));
+
+                // cruz cardinal
                 DrawRadarCross({rcx, rcy}, rr);
-                DrawDot({rcx, rcy}, 5, RGB(0,255,100));
+
+                // rotación según cámara (usar ViewMatrix forward)
+                float camYaw = atan2f(vm.m[0][2], vm.m[0][0]);
+
                 float scale = rr / fRadarRange;
                 for (auto& e : g_radarEntries) {
-                    float ex = rcx + e.dx * scale;
-                    float ey = rcy - e.dz * scale;
+                    // rotar según cámara
+                    float cosY = cosf(-camYaw), sinY = sinf(-camYaw);
+                    float rx = e.dx * cosY - e.dz * sinY;
+                    float ry = e.dx * sinY + e.dz * cosY;
+
+                    float ex = rcx + rx * scale;
+                    float ey = rcy + ry * scale;
+
+                    // clamp dentro del círculo
                     float ddx = ex - rcx, ddy = ey - rcy;
                     float dd  = sqrtf(ddx*ddx + ddy*ddy);
-                    if (dd > rr - 4.f) { float f = (rr-4.f)/dd; ex = rcx+ddx*f; ey = rcy+ddy*f; }
-                    DrawDot({ex, ey}, 4, e.col);
+                    bool clamped = false;
+                    if (dd > rr - 6.f) { float f = (rr-6.f)/dd; ex = rcx+ddx*f; ey = rcy+ddy*f; clamped = true; }
+
+                    // tamaño del dot según distancia (más cerca = más grande)
+                    int dotR = clamped ? 3 : (e.dist < 50.f ? 5 : 4);
+                    DrawDot({ex, ey}, dotR, e.col);
+
+                    // nombre si está cerca (<80 studs)
+                    if (!clamped && e.dist < 80.f && !e.name.empty()) {
+                        // nombre chiquito debajo del dot
+                        SetBkMode(g_memDC, TRANSPARENT);
+                        SetTextColor(g_memDC, e.col);
+                        int len = (int)e.name.size();
+                        SIZE sz{};
+                        GetTextExtentPoint32A(g_memDC, e.name.c_str(), len, &sz);
+                        TextOutA(g_memDC, (int)(ex - sz.cx/2), (int)(ey + dotR + 1), e.name.c_str(), len);
+                    }
                 }
-                DrawEllipse({rcx, rcy}, rr, rr, RGB(80,80,120));
+
+                // borde exterior
+                DrawEllipse({rcx, rcy}, rr, rr, RGB(80,100,160));
+
+                // jugador local (triángulo apuntando arriba)
+                DrawDot({rcx, rcy}, 4, RGB(0,255,100));
+                // flecha arriba indicando "frente"
+                DrawLine({rcx, rcy-7}, {rcx-4, rcy-2}, RGB(0,255,100), 2);
+                DrawLine({rcx, rcy-7}, {rcx+4, rcy-2}, RGB(0,255,100), 2);
+
+                // texto "RADAR" arriba
+                DrawText2D({rcx, rcy - rr - 12.f}, "RADAR", RGB(80,100,160));
+            }
+        }
+
+        // ---- crosshair personalizado ----
+        if (bCrosshair) {
+            float cx = (float)g_width * 0.5f, cy = (float)g_height * 0.5f;
+            if (iCrosshairStyle == 0 || iCrosshairStyle == 2) {
+                // cruz con outline
+                DrawLine({cx-8,cy},{cx+8,cy}, RGB(0,0,0), 3);
+                DrawLine({cx,cy-8},{cx,cy+8}, RGB(0,0,0), 3);
+                DrawLine({cx-7,cy},{cx+7,cy}, RGB(0,255,100), 1);
+                DrawLine({cx,cy-7},{cx,cy+7}, RGB(0,255,100), 1);
+            }
+            if (iCrosshairStyle == 1 || iCrosshairStyle == 2) {
+                DrawDot({cx, cy}, 2, RGB(255,50,50));
+            }
+        }
+
+        // ---- hitmarker ----
+        if (bHitmarker && g_hitmarkerTime) {
+            DWORD elapsed = GetTickCount() - g_hitmarkerTime;
+            if (elapsed < HITMARKER_DURATION) {
+                float cx = (float)g_width * 0.5f, cy = (float)g_height * 0.5f;
+                float sz = 8.f;
+                int alpha = 255 - (int)(255.f * elapsed / HITMARKER_DURATION);
+                (void)alpha; // GDI no soporta alpha, usamos blanco que se desvanece no se puede, lo dejamos fijo
+                COLORREF hcol = RGB(255, 255, 255);
+                DrawLine({cx-sz,cy-sz},{cx-3,cy-3}, RGB(0,0,0), 3);
+                DrawLine({cx+sz,cy-sz},{cx+3,cy-3}, RGB(0,0,0), 3);
+                DrawLine({cx-sz,cy+sz},{cx-3,cy+3}, RGB(0,0,0), 3);
+                DrawLine({cx+sz,cy+sz},{cx+3,cy+3}, RGB(0,0,0), 3);
+                DrawLine({cx-sz,cy-sz},{cx-3,cy-3}, hcol, 2);
+                DrawLine({cx+sz,cy-sz},{cx+3,cy-3}, hcol, 2);
+                DrawLine({cx-sz,cy+sz},{cx-3,cy+3}, hcol, 2);
+                DrawLine({cx+sz,cy+sz},{cx+3,cy+3}, hcol, 2);
+            } else {
+                g_hitmarkerTime = 0;
+            }
+        }
+
+        // ---- killfeed ----
+        if (bKillfeed) {
+            DWORD now = GetTickCount();
+            // limpiar entradas viejas
+            g_killfeed.erase(std::remove_if(g_killfeed.begin(), g_killfeed.end(),
+                [now](const KillfeedEntry& e) { return now - e.time > KILLFEED_DURATION; }),
+                g_killfeed.end());
+            float ky = 20.f;
+            for (auto& kf : g_killfeed) {
+                std::string txt = "ELIMINADO: " + kf.name;
+                DrawText2D({(float)g_width - 150.f, ky}, txt, RGB(255, 60, 60));
+                ky += 20.f;
             }
         }
 
@@ -1212,51 +1511,81 @@ int main() {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // ---- estilo visual ----
+        // ---- estilo visual premium ----
         {
             ImGuiStyle& st = ImGui::GetStyle();
-            st.WindowRounding  = 10.f; st.FrameRounding  = 6.f;
-            st.GrabRounding    = 6.f;  st.ScrollbarRounding = 6.f;
-            st.ItemSpacing     = ImVec2(8, 7);
-            st.FramePadding    = ImVec2(8, 5);
+            st.WindowRounding    = 12.f;  st.FrameRounding    = 8.f;
+            st.GrabRounding      = 8.f;   st.ScrollbarRounding = 8.f;
+            st.TabRounding       = 6.f;   st.ChildRounding     = 8.f;
+            st.PopupRounding     = 8.f;
+            st.WindowBorderSize  = 0.f;   st.FrameBorderSize   = 0.f;
+            st.ItemSpacing       = ImVec2(10, 8);
+            st.FramePadding      = ImVec2(10, 6);
+            st.WindowPadding     = ImVec2(18, 14);
+            st.ScrollbarSize     = 10.f;
+            st.GrabMinSize       = 10.f;
             ImVec4* c = st.Colors;
-            c[ImGuiCol_WindowBg]       = ImVec4(0.07f,0.07f,0.10f,0.97f);
-            c[ImGuiCol_TitleBg]        = ImVec4(0.10f,0.06f,0.20f,1.f);
-            c[ImGuiCol_TitleBgActive]  = ImVec4(0.16f,0.09f,0.32f,1.f);
-            c[ImGuiCol_FrameBg]        = ImVec4(0.14f,0.14f,0.22f,1.f);
-            c[ImGuiCol_FrameBgHovered] = ImVec4(0.22f,0.18f,0.36f,1.f);
-            c[ImGuiCol_FrameBgActive]  = ImVec4(0.28f,0.22f,0.45f,1.f);
-            c[ImGuiCol_CheckMark]      = ImVec4(0.45f,0.85f,1.f, 1.f);
-            c[ImGuiCol_SliderGrab]     = ImVec4(0.45f,0.75f,1.f, 1.f);
-            c[ImGuiCol_SliderGrabActive]= ImVec4(0.6f,0.9f,1.f,1.f);
-            c[ImGuiCol_Button]         = ImVec4(0.18f,0.25f,0.50f,1.f);
-            c[ImGuiCol_ButtonHovered]  = ImVec4(0.28f,0.40f,0.75f,1.f);
-            c[ImGuiCol_ButtonActive]   = ImVec4(0.38f,0.55f,0.95f,1.f);
-            c[ImGuiCol_Tab]            = ImVec4(0.12f,0.10f,0.20f,1.f);
-            c[ImGuiCol_TabHovered]     = ImVec4(0.28f,0.22f,0.50f,1.f);
-            c[ImGuiCol_TabSelected]    = ImVec4(0.22f,0.16f,0.42f,1.f);
-            c[ImGuiCol_Header]         = ImVec4(0.20f,0.15f,0.38f,1.f);
-            c[ImGuiCol_HeaderHovered]  = ImVec4(0.28f,0.22f,0.50f,1.f);
-            c[ImGuiCol_SeparatorActive]= ImVec4(0.45f,0.35f,0.80f,1.f);
-            c[ImGuiCol_ScrollbarBg]    = ImVec4(0.05f,0.05f,0.08f,1.f);
-            c[ImGuiCol_ScrollbarGrab]  = ImVec4(0.25f,0.20f,0.45f,1.f);
+            c[ImGuiCol_WindowBg]         = ImVec4(0.06f,0.06f,0.09f,1.f);
+            c[ImGuiCol_ChildBg]          = ImVec4(0.08f,0.08f,0.12f,1.f);
+            c[ImGuiCol_PopupBg]          = ImVec4(0.08f,0.08f,0.12f,0.98f);
+            c[ImGuiCol_Border]           = ImVec4(0.15f,0.15f,0.25f,0.5f);
+            c[ImGuiCol_TitleBg]          = ImVec4(0.06f,0.06f,0.09f,1.f);
+            c[ImGuiCol_TitleBgActive]    = ImVec4(0.06f,0.06f,0.09f,1.f);
+            c[ImGuiCol_FrameBg]          = ImVec4(0.10f,0.10f,0.16f,1.f);
+            c[ImGuiCol_FrameBgHovered]   = ImVec4(0.15f,0.14f,0.24f,1.f);
+            c[ImGuiCol_FrameBgActive]    = ImVec4(0.20f,0.18f,0.32f,1.f);
+            c[ImGuiCol_CheckMark]        = ImVec4(0.40f,0.75f,1.f,1.f);
+            c[ImGuiCol_SliderGrab]       = ImVec4(0.35f,0.65f,1.f,1.f);
+            c[ImGuiCol_SliderGrabActive] = ImVec4(0.50f,0.80f,1.f,1.f);
+            c[ImGuiCol_Button]           = ImVec4(0.14f,0.16f,0.28f,1.f);
+            c[ImGuiCol_ButtonHovered]    = ImVec4(0.22f,0.28f,0.52f,1.f);
+            c[ImGuiCol_ButtonActive]     = ImVec4(0.30f,0.38f,0.68f,1.f);
+            c[ImGuiCol_Tab]              = ImVec4(0.08f,0.08f,0.14f,1.f);
+            c[ImGuiCol_TabHovered]       = ImVec4(0.22f,0.22f,0.42f,1.f);
+            c[ImGuiCol_TabSelected]      = ImVec4(0.16f,0.16f,0.30f,1.f);
+            c[ImGuiCol_Header]           = ImVec4(0.14f,0.14f,0.26f,1.f);
+            c[ImGuiCol_HeaderHovered]    = ImVec4(0.20f,0.20f,0.38f,1.f);
+            c[ImGuiCol_HeaderActive]     = ImVec4(0.26f,0.26f,0.48f,1.f);
+            c[ImGuiCol_Separator]        = ImVec4(0.15f,0.15f,0.25f,0.6f);
+            c[ImGuiCol_SeparatorHovered] = ImVec4(0.30f,0.30f,0.60f,0.8f);
+            c[ImGuiCol_SeparatorActive]  = ImVec4(0.40f,0.40f,0.80f,1.f);
+            c[ImGuiCol_ScrollbarBg]      = ImVec4(0.04f,0.04f,0.07f,1.f);
+            c[ImGuiCol_ScrollbarGrab]    = ImVec4(0.20f,0.20f,0.35f,1.f);
+            c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.28f,0.28f,0.48f,1.f);
+            c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.35f,0.35f,0.58f,1.f);
+            c[ImGuiCol_Text]             = ImVec4(0.88f,0.88f,0.92f,1.f);
+            c[ImGuiCol_TextDisabled]     = ImVec4(0.40f,0.40f,0.50f,1.f);
         }
 
         // ---- pantalla de ban ----
         if (g_hwIdBanned) {
-            ImGui::SetNextWindowSize({ 490, 200 }, ImGuiCond_Always);
-            ImGui::SetNextWindowPos({ 0, 0 }, ImGuiCond_Always);
-            ImGui::Begin("  ceitus", nullptr, ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse);
-            ImGui::TextColored(ImVec4(1,0.2f,0.2f,1), "HWID BANEADO");
-            ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Tu PC fue baneada. Contacta al soporte.");
-            ImGui::Text("HWID: %s", HWIDString().c_str());
+            ImGui::SetNextWindowSize({520, 820}, ImGuiCond_Always);
+            ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
+            ImGui::Begin("##ban", nullptr,
+                ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoTitleBar);
+            ImDrawList* bdl = ImGui::GetWindowDrawList();
+            ImVec2 bwp = ImGui::GetWindowPos(), bws = ImGui::GetWindowSize();
+            bdl->AddRectFilled(bwp, {bwp.x+bws.x, bwp.y+3}, IM_COL32(220,50,50,255));
+            ImGui::Dummy({0, bws.y * 0.35f});
+            auto CenterBan = [](const char* t, ImVec4 col){
+                float w = ImGui::CalcTextSize(t).x;
+                ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w)*0.5f + ImGui::GetCursorPosX());
+                ImGui::TextColored(col, "%s", t);
+            };
+            CenterBan("ACCESO DENEGADO", ImVec4(1,0.25f,0.25f,1));
+            ImGui::Spacing();
+            CenterBan("Tu PC fue baneada.", ImVec4(0.65f,0.65f,0.72f,1));
+            CenterBan("Contacta al soporte.", ImVec4(0.50f,0.50f,0.60f,1));
+            ImGui::Spacing(); ImGui::Spacing();
+            char hwidBuf[32]; snprintf(hwidBuf,sizeof(hwidBuf),"HWID: %s",HWIDString().c_str());
+            CenterBan(hwidBuf, ImVec4(0.35f,0.35f,0.45f,1));
             ImGui::End();
             ImGui::Render();
             const float clr[4]{};
             g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
             g_ctx->ClearRenderTargetView(g_rtv, clr);
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-            g_chain->Present(0, 0); Sleep(16);
+            g_chain->Present(0, 0); Sleep(1);
             continue;
         }
 
@@ -1267,92 +1596,139 @@ int main() {
             static bool keyMsgBad = false;
             static bool checking = false;
 
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,  ImVec2(24, 20));
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(8, 10));
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,   ImVec2(10, 8));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,  8.f);
-            ImGui::PushStyleColor(ImGuiCol_WindowBg,       ImVec4(0.08f,0.08f,0.13f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_TitleBg,        ImVec4(0.08f,0.08f,0.13f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_TitleBgActive,  ImVec4(0.08f,0.08f,0.13f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_Button,         ImVec4(0.12f,0.38f,0.22f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.18f,0.55f,0.32f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.25f,0.70f,0.42f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.13f,0.13f,0.20f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.20f,0.20f,0.32f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_Border,         ImVec4(0.25f,0.25f,0.45f,0.7f));
-
             auto CenterText = [](const char* txt, ImVec4 col){
                 float w = ImGui::CalcTextSize(txt).x;
                 ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w) * 0.5f + ImGui::GetCursorPosX());
                 ImGui::TextColored(col, "%s", txt);
             };
 
-            ImGui::SetNextWindowSize({500, 780}, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({520, 820}, ImGuiCond_Always);
             ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
             ImGui::Begin("##keywin", nullptr,
                 ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
-                ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoTitleBar);
+                ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoScrollbar);
 
-            // centrar verticalmente (~280px de contenido)
-            ImGui::Dummy({0, (780.f - 280.f) * 0.5f - 20.f});
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 wp = ImGui::GetWindowPos();
+            ImVec2 ws = ImGui::GetWindowSize();
 
-            CenterText("ceitus", ImVec4(0.55f,0.75f,1.f,1.f));
-            ImGui::Spacing();
-            CenterText("Bienvenido", ImVec4(0.88f,0.88f,0.88f,1.f));
-            ImGui::Spacing(); ImGui::Spacing();
+            // gradient background top
+            dl->AddRectFilledMultiColor(wp, {wp.x+ws.x, wp.y+220},
+                IM_COL32(20,25,60,255), IM_COL32(15,20,50,255),
+                IM_COL32(15,15,25,255), IM_COL32(15,15,25,255));
 
-            // linea decorativa
+            // accent line at top
+            dl->AddRectFilled(wp, {wp.x+ws.x, wp.y+3}, IM_COL32(80,140,255,200));
+
+            // drag area
             {
-                ImVec2 p = ImGui::GetCursorScreenPos();
-                float lw = ImGui::GetContentRegionAvail().x;
-                ImGui::GetWindowDrawList()->AddRectFilled({p.x,p.y},{p.x+lw,p.y+1}, IM_COL32(80,100,200,130));
-                ImGui::Dummy({0,10});
+                ImVec2 mpos = ImGui::GetMousePos();
+                bool inDrag = (mpos.x >= wp.x && mpos.x <= wp.x+ws.x && mpos.y >= wp.y && mpos.y <= wp.y+60);
+                if (inDrag && ImGui::IsMouseClicked(0) && !s_dragging) {
+                    s_dragging = true; GetCursorPos(&s_dragStart);
+                    RECT wr; GetWindowRect(s_menuWnd, &wr);
+                    s_dragStart.x -= wr.left; s_dragStart.y -= wr.top;
+                }
+                if (s_dragging && ImGui::IsMouseDown(0)) {
+                    POINT cur; GetCursorPos(&cur);
+                    SetWindowPos(s_menuWnd, nullptr, cur.x-s_dragStart.x, cur.y-s_dragStart.y, 0, 0,
+                        SWP_NOSIZE|SWP_NOZORDER);
+                }
+                if (!ImGui::IsMouseDown(0)) s_dragging = false;
             }
 
-            CenterText("Ingresa tu key de acceso", ImVec4(0.55f,0.60f,0.72f,1.f));
-            ImGui::Spacing(); ImGui::Spacing();
+            // close button
+            {
+                ImVec2 cpos = {wp.x+ws.x-36, wp.y+8};
+                ImVec2 mpos = ImGui::GetMousePos();
+                bool hov = (mpos.x>=cpos.x && mpos.x<=cpos.x+26 && mpos.y>=cpos.y && mpos.y<=cpos.y+26);
+                dl->AddRectFilled(cpos, {cpos.x+26,cpos.y+26},
+                    hov ? IM_COL32(200,60,60,200) : IM_COL32(60,60,80,150), 6.f);
+                dl->AddLine({cpos.x+7,cpos.y+7},{cpos.x+19,cpos.y+19}, IM_COL32(220,220,220,220), 2.f);
+                dl->AddLine({cpos.x+19,cpos.y+7},{cpos.x+7,cpos.y+19}, IM_COL32(220,220,220,220), 2.f);
+                if (hov && ImGui::IsMouseClicked(0)) PostQuitMessage(0);
+            }
 
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.65f,0.85f,1.f));
-            ImGui::Text("Key:");
-            ImGui::PopStyleColor();
-            float copyBtnW = 60.f;
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - copyBtnW - 6.f);
+            ImGui::Dummy({0, 100});
+
+            // logo
+            ImGui::PushFont(ImGui::GetFont());
+            float oldScale = ImGui::GetFont()->Scale;
+            ImGui::GetFont()->Scale = 2.2f;
+            ImGui::PushFont(ImGui::GetFont());
+            CenterText("CEITUS", ImVec4(0.45f,0.70f,1.f,1.f));
+            ImGui::PopFont();
+            ImGui::GetFont()->Scale = oldScale;
+            ImGui::PopFont();
+
+            ImGui::Spacing();
+            CenterText("Roblox External", ImVec4(0.45f,0.50f,0.65f,1.f));
+            ImGui::Dummy({0, 40});
+
+            // card container
+            float cardW = 380.f;
+            float padX = (ImGui::GetContentRegionAvail().x - cardW) * 0.5f;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + padX);
+            ImGui::BeginChild("##logincard", {cardW, 320}, false, ImGuiWindowFlags_NoScrollbar);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0,0,0,0));
+
+            // card background
+            ImVec2 cp = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                {cp.x-10, cp.y-10}, {cp.x+cardW+10, cp.y+320},
+                IM_COL32(18,18,30,240), 12.f);
+            ImGui::GetWindowDrawList()->AddRect(
+                {cp.x-10, cp.y-10}, {cp.x+cardW+10, cp.y+320},
+                IM_COL32(60,80,160,80), 12.f, 0, 1.f);
+
+            ImGui::Dummy({0, 20});
+            CenterText("Ingresa tu key de acceso", ImVec4(0.55f,0.60f,0.72f,1.f));
+            ImGui::Dummy({0, 16});
+
+            ImGui::TextColored(ImVec4(0.50f,0.55f,0.70f,1.f), "KEY");
+            ImGui::Spacing();
+            float pasteW = 70.f;
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - pasteW - 8.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12, 10));
             bool enterPressed = ImGui::InputText("##key", keyBuf, sizeof(keyBuf),
                 ImGuiInputTextFlags_EnterReturnsTrue);
-            ImGui::SameLine(0, 6);
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f,0.18f,0.30f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f,0.28f,0.46f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.30f,0.38f,0.60f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.75f,0.85f,1.f,1.f));
-            if (ImGui::Button("Pegar", {copyBtnW, 0})) {
+            ImGui::PopStyleVar();
+            ImGui::SameLine(0, 8);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.12f,0.14f,0.26f,1.f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.18f,0.22f,0.40f,1.f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.24f,0.30f,0.55f,1.f));
+            if (ImGui::Button("Pegar", {pasteW, 0})) {
                 if (OpenClipboard(nullptr)) {
                     HANDLE hData = GetClipboardData(CF_TEXT);
                     if (hData) {
                         char* pText = static_cast<char*>(GlobalLock(hData));
-                        if (pText) {
-                            strncpy_s(keyBuf, sizeof(keyBuf), pText, sizeof(keyBuf)-1);
-                            GlobalUnlock(hData);
-                        }
+                        if (pText) { strncpy_s(keyBuf, sizeof(keyBuf), pText, sizeof(keyBuf)-1); GlobalUnlock(hData); }
                     }
                     CloseClipboard();
                 }
             }
-            ImGui::PopStyleColor(4);
-            ImGui::Spacing(); ImGui::Spacing();
+            ImGui::PopStyleColor(3);
+            ImGui::Dummy({0, 12});
 
             bool doActivate = enterPressed;
             if (checking) {
-                CenterText("Verificando...", ImVec4(0.6f,0.7f,1.f,1.f));
+                // animated dots
+                int dots = (GetTickCount()/400) % 4;
+                char loadTxt[24]; snprintf(loadTxt, sizeof(loadTxt), "Verificando%.*s", dots, "...");
+                CenterText(loadTxt, ImVec4(0.45f,0.65f,1.f,1.f));
             } else {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,1,1));
-                if (ImGui::Button("Activar", {-1, 42})) doActivate = true;
-                ImGui::PopStyleColor();
+                ImGui::PushStyleColor(ImGuiCol_Button,       ImVec4(0.20f,0.45f,0.85f,1.f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f,0.55f,0.95f,1.f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.35f,0.60f,1.f,1.f));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, 10));
+                if (ImGui::Button("Activar", {-1, 0})) doActivate = true;
+                ImGui::PopStyleVar();
+                ImGui::PopStyleColor(3);
             }
 
             if (doActivate && !checking) {
                 std::string k(keyBuf);
-                for (auto& c : k) c = (char)toupper(c);
+                for (auto& ch : k) ch = (char)toupper(ch);
                 if (k.size() < 18) { keyMsg="Key demasiado corta."; keyMsgBad=true; }
                 else {
                     checking = true; keyMsg = ""; keyMsgBad = false;
@@ -1378,23 +1754,24 @@ int main() {
 
             if (!keyMsg.empty()) {
                 ImGui::Spacing();
-                if (keyMsgBad) ImGui::TextColored(ImVec4(1,0.35f,0.35f,1), "  %s", keyMsg.c_str());
-                else ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "  %s", keyMsg.c_str());
+                if (keyMsgBad) ImGui::TextColored(ImVec4(1,0.35f,0.35f,1), "%s", keyMsg.c_str());
+                else ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "%s", keyMsg.c_str());
             }
 
-            ImGui::Spacing(); ImGui::Spacing(); ImGui::Spacing(); ImGui::Spacing();
-            CenterText("v" CEITUS_VERSION, ImVec4(0.25f,0.25f,0.35f,1.f));
+            ImGui::PopStyleColor();
+            ImGui::EndChild();
+
+            ImGui::Dummy({0, 20});
+            CenterText("v" CEITUS_VERSION, ImVec4(0.22f,0.22f,0.32f,1.f));
 
             ImGui::End();
-            ImGui::PopStyleColor(9);
-            ImGui::PopStyleVar(5);
 
             ImGui::Render();
             const float clr[4]{};
             g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
             g_ctx->ClearRenderTargetView(g_rtv, clr);
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-            g_chain->Present(0, 0); Sleep(16);
+            g_chain->Present(0, 0); Sleep(1);
             continue;
         }
 
@@ -1419,26 +1796,99 @@ int main() {
             }
         }
 
-        ImGui::SetNextWindowSize({ 490, 760 }, ImGuiCond_Always);
-        ImGui::SetNextWindowPos({ 0, 0 }, ImGuiCond_Always);
-        ImGui::Begin("  ceitus", nullptr,
-            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+        ImGui::SetNextWindowSize({520, 820}, ImGuiCond_Always);
+        ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
+        ImGui::Begin("##main", nullptr,
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
 
-        // ---- selector de juego ----
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f,0.7f,1.f,1.f));
-        ImGui::Text("JUEGO");
-        ImGui::PopStyleColor();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wp = ImGui::GetWindowPos();
+        ImVec2 ws = ImGui::GetWindowSize();
+
+        // header gradient
+        dl->AddRectFilledMultiColor(wp, {wp.x+ws.x, wp.y+70},
+            IM_COL32(18,22,55,255), IM_COL32(14,18,45,255),
+            IM_COL32(15,15,25,255), IM_COL32(15,15,25,255));
+        // accent line
+        dl->AddRectFilled(wp, {wp.x+ws.x, wp.y+3}, IM_COL32(80,140,255,200));
+
+        // drag area
+        {
+            ImVec2 mpos = ImGui::GetMousePos();
+            bool inDrag = (mpos.x >= wp.x && mpos.x <= wp.x+ws.x && mpos.y >= wp.y && mpos.y <= wp.y+70);
+            if (inDrag && ImGui::IsMouseClicked(0) && !s_dragging) {
+                s_dragging = true; GetCursorPos(&s_dragStart);
+                RECT wr; GetWindowRect(s_menuWnd, &wr);
+                s_dragStart.x -= wr.left; s_dragStart.y -= wr.top;
+            }
+            if (s_dragging && ImGui::IsMouseDown(0)) {
+                POINT cur; GetCursorPos(&cur);
+                SetWindowPos(s_menuWnd, nullptr, cur.x-s_dragStart.x, cur.y-s_dragStart.y, 0,0,
+                    SWP_NOSIZE|SWP_NOZORDER);
+            }
+            if (!ImGui::IsMouseDown(0)) s_dragging = false;
+        }
+
+        // close / minimize buttons
+        {
+            // minimize
+            ImVec2 mpos2 = {wp.x+ws.x-70, wp.y+8};
+            ImVec2 mp = ImGui::GetMousePos();
+            bool hMin = (mp.x>=mpos2.x && mp.x<=mpos2.x+26 && mp.y>=mpos2.y && mp.y<=mpos2.y+26);
+            dl->AddRectFilled(mpos2, {mpos2.x+26,mpos2.y+26},
+                hMin ? IM_COL32(80,80,120,200) : IM_COL32(50,50,70,150), 6.f);
+            dl->AddLine({mpos2.x+6,mpos2.y+13},{mpos2.x+20,mpos2.y+13}, IM_COL32(200,200,220,220), 2.f);
+            if (hMin && ImGui::IsMouseClicked(0)) ShowWindow(s_menuWnd, SW_MINIMIZE);
+            // close
+            ImVec2 cpos = {wp.x+ws.x-36, wp.y+8};
+            bool hCl = (mp.x>=cpos.x && mp.x<=cpos.x+26 && mp.y>=cpos.y && mp.y<=cpos.y+26);
+            dl->AddRectFilled(cpos, {cpos.x+26,cpos.y+26},
+                hCl ? IM_COL32(200,60,60,200) : IM_COL32(50,50,70,150), 6.f);
+            dl->AddLine({cpos.x+7,cpos.y+7},{cpos.x+19,cpos.y+19}, IM_COL32(220,220,220,220), 2.f);
+            dl->AddLine({cpos.x+19,cpos.y+7},{cpos.x+7,cpos.y+19}, IM_COL32(220,220,220,220), 2.f);
+            if (hCl && ImGui::IsMouseClicked(0)) PostQuitMessage(0);
+        }
+
+        // header title
+        ImGui::SetCursorPos({20, 18});
+        ImGui::PushFont(ImGui::GetFont());
+        float oldS = ImGui::GetFont()->Scale;
+        ImGui::GetFont()->Scale = 1.5f;
+        ImGui::PushFont(ImGui::GetFont());
+        ImGui::TextColored(ImVec4(0.45f,0.70f,1.f,1.f), "CEITUS");
+        ImGui::PopFont();
+        ImGui::GetFont()->Scale = oldS;
+        ImGui::PopFont();
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(26);
+        ImGui::TextColored(ImVec4(0.40f,0.42f,0.55f,1.f), "v" CEITUS_VERSION);
+
+        // status indicator
+        {
+            bool attached = dbgDM && dbgPS;
+            ImVec2 sp = {wp.x + ws.x - 150, wp.y + 46};
+            dl->AddCircleFilled(sp, 5.f, attached ? IM_COL32(60,220,100,255) : IM_COL32(220,60,60,255));
+            dl->AddText({sp.x+12, sp.y-8}, attached ? IM_COL32(60,220,100,200) : IM_COL32(220,100,100,200),
+                attached ? "Conectado" : "Buscando...");
+        }
+
+        ImGui::SetCursorPos({18, 78});
+
+        // game selector section
+        ImGui::BeginChild("##content", {ws.x - 36, ws.y - 90}, false);
+
+        ImGui::TextColored(ImVec4(0.40f,0.45f,0.60f,1.f), "JUEGO");
         ImGui::SetNextItemWidth(-1);
-        { // auto-detección por PlaceId — siempre activa, sobreescribe el modo guardado
-          static int64_t lastAutoPlace = 0;
+        { static int64_t lastAutoPlace = 0;
           if (g_placeId != 0 && g_placeId != lastAutoPlace) {
               lastAutoPlace = g_placeId;
               int detected = 0;
-              if      (g_placeId == 286090429LL)    detected = 3; // Arsenal
-              else if (g_placeId == 2626726391LL)   detected = 1; // Counterblox
-              else if (g_placeId == 17625359962LL)  detected = 4; // Rivals (id conocido)
-              else if (g_rivalsPlaceId != 0 && g_placeId == g_rivalsPlaceId) detected = 4; // Rivals (guardado)
-              else                                  detected = 0; // juego desconocido → Auto
+              if      (g_placeId == 286090429LL)    detected = 3;
+              else if (g_placeId == 2626726391LL)   detected = 1;
+              else if (g_placeId == 17625359962LL)  detected = 4;
+              else if (g_rivalsPlaceId != 0 && g_placeId == g_rivalsPlaceId) detected = 4;
+              else                                  detected = 0;
               int prev = gameMode;
               if (detected != prev) { SaveConfig(prev); LoadConfig(detected); gameMode = detected; }
           }
@@ -1454,37 +1904,37 @@ int main() {
             // ======= TAB: VISUAL =======
             if (ImGui::BeginTabItem("  Visual  ")) {
                 ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "ESP");
+                ImGui::Spacing();
                 ImGui::Checkbox("ESP activado", &bESP);
                 if (bESP) {
-                    ImGui::Indent(10.f);
-                    ImGui::SetNextItemWidth(200.f);
-                    static const char* espColors[] = { "Por equipo", "Rojo", "Azul", "Naranja", "Verde", "Multicolor (Rainbow)" };
-                    ImGui::Combo("Color ESP", &espColorMode, espColors, 6);
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(220.f);
+                    static const char* espColors[] = { "Por equipo", "Rojo", "Azul", "Naranja", "Verde", "Rainbow" };
+                    ImGui::Combo("Color", &espColorMode, espColors, 6);
                     ImGui::Spacing();
-                    ImGui::Checkbox("Cajas",        &bBoxes);
-                    ImGui::Checkbox("Barra de vida",&bHealthBar);
-                    ImGui::Checkbox("Skeleton",     &bSkeleton);
-                    ImGui::Checkbox("Nombres",      &bNames);
-                    ImGui::Checkbox("Distancia",    &bDistance);
-                    ImGui::Checkbox("Snaplines",    &bSnaplines);
-                    ImGui::Unindent(10.f);
+                    ImGui::Checkbox("Cajas",        &bBoxes);     ImGui::SameLine(200); ImGui::Checkbox("Nombres",    &bNames);
+                    ImGui::Checkbox("Barra de vida",&bHealthBar);  ImGui::SameLine(200); ImGui::Checkbox("Distancia",  &bDistance);
+                    ImGui::Checkbox("Skeleton",     &bSkeleton);  ImGui::SameLine(200); ImGui::Checkbox("Snaplines",  &bSnaplines);
+                    ImGui::Checkbox("Chams (glow)", &bChams);
+                    ImGui::Unindent(12.f);
                 }
-                ImGui::Spacing();
-                ImGui::Separator();
+                ImGui::Spacing(); ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "RADAR");
                 ImGui::Spacing();
                 ImGui::Checkbox("Radar (mini-mapa)", &bRadar);
                 if (bRadar) {
-                    ImGui::Indent(10.f);
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Rango (studs)", &fRadarRange, 50.f, 500.f, "%.0f");
-                    ImGui::Unindent(10.f);
+                    ImGui::Unindent(12.f);
                 }
-                // opciones Counterblox
                 if (gameMode == 1) {
+                    ImGui::Spacing(); ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "COUNTERBLOX");
                     ImGui::Spacing();
-                    ImGui::Separator();
-                    ImGui::Spacing();
-                    ImGui::TextColored(ImVec4(0.7f,0.7f,1.f,1.f), "Counterblox");
                     ImGui::Checkbox("Anti-Flash", &bAntiFlash);
+                    ImGui::SameLine(200);
                     ImGui::Checkbox("Anti-Humo",  &bAntiSmoke);
                 }
                 ImGui::EndTabItem();
@@ -1493,7 +1943,8 @@ int main() {
             // ======= TAB: COMBATE =======
             if (ImGui::BeginTabItem("  Combate  ")) {
                 ImGui::Spacing();
-                // label dinámico de aimbot
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "AIMBOT");
+                ImGui::Spacing();
                 char aimbotLabel[48];
                 if (aimbotKey == VK_XBUTTON1) snprintf(aimbotLabel,sizeof(aimbotLabel),"Aimbot [Mouse4]");
                 else if (aimbotKey == VK_XBUTTON2) snprintf(aimbotLabel,sizeof(aimbotLabel),"Aimbot [Mouse5]");
@@ -1503,17 +1954,23 @@ int main() {
                 else snprintf(aimbotLabel,sizeof(aimbotLabel),"Aimbot [VK%d]",aimbotKey);
                 ImGui::Checkbox(aimbotLabel, &bAimbot);
                 if (bAimbot) {
-                    ImGui::Indent(10.f);
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("FOV px",       &fAimFov,      30.f, 400.f, "%.0f");
+                    ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Dist max (m)", &fAimMaxDist,  30.f, 1000000.f, "%.0f", ImGuiSliderFlags_Logarithmic);
+                    ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Velocidad",    &fAimSmooth,    1.f,   80.f, "%.0f%%");
-                    ImGui::Checkbox("Ignorar equipo (aimbot)", &bAimbotTeamFilter);
-                    ImGui::Checkbox("Apuntar a todos (sin FOV)", &bAimbotNoFov);
-                    // cambiar tecla
+                    static const char* aimBoneNames[] = { "Cabeza", "Cuello", "Pecho" };
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::Combo("Aimlock", &iAimBone, aimBoneNames, 3);
+                    ImGui::Checkbox("Ignorar equipo", &bAimbotTeamFilter);
+                    ImGui::SameLine(200);
+                    ImGui::Checkbox("Sin FOV", &bAimbotNoFov);
                     static bool waitingForKey = false;
                     static DWORD waitStartTime = 0;
                     if (waitingForKey) {
-                        ImGui::TextColored(ImVec4(1,1,0,1), "Presiona tecla... (ESC cancela)");
+                        ImGui::TextColored(ImVec4(0.45f,0.70f,1.f,1.f), "Presiona tecla... (ESC cancela)");
                         if (GetTickCount() - waitStartTime > 300) {
                             int mouseVKs[] = { VK_XBUTTON1, VK_XBUTTON2, VK_MBUTTON };
                             for (int mv : mouseVKs)
@@ -1531,92 +1988,112 @@ int main() {
                             aimbotKey==VK_MBUTTON?"Mouse3":aimbotLabel+7);
                         if (ImGui::Button(btnLabel,ImVec2(-1,0))){waitingForKey=true;waitStartTime=GetTickCount();}
                     }
-                    ImGui::Unindent(10.f);
+                    ImGui::Unindent(12.f);
                 }
-                ImGui::Spacing();
-                ImGui::Separator();
+                ImGui::Spacing(); ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "TRIGGERBOT");
                 ImGui::Spacing();
                 ImGui::Checkbox("Triggerbot (auto-disparo)", &bTriggerbot);
                 if (bTriggerbot) {
-                    ImGui::Indent(10.f);
-                    ImGui::SliderFloat("Radio disparo px", &fTriggerFov, 2.f, 40.f, "%.0f");
-                    ImGui::Unindent(10.f);
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderFloat("Radio (px)", &fTriggerFov, 2.f, 40.f, "%.0f");
+                    ImGui::Unindent(12.f);
                 }
-                ImGui::Spacing();
-                ImGui::Separator();
+                ImGui::Spacing(); ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "EXTRAS");
                 ImGui::Spacing();
                 ImGui::Checkbox("Prediccion de movimiento", &bPrediction);
                 if (bPrediction) {
-                    ImGui::Indent(10.f);
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Tiempo (s)", &fPrediction, 0.01f, 0.3f, "%.2f");
-                    ImGui::Unindent(10.f);
+                    ImGui::Unindent(12.f);
                 }
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::Spacing();
                 ImGui::Checkbox("Bunny Hop [Space]", &bBhop);
+                ImGui::Spacing(); ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "HUD");
+                ImGui::Spacing();
+                ImGui::Checkbox("Crosshair", &bCrosshair);
+                if (bCrosshair) {
+                    ImGui::Indent(12.f);
+                    static const char* crossStyles[] = { "Cruz", "Punto", "Cruz + Punto" };
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::Combo("Estilo##cross", &iCrosshairStyle, crossStyles, 3);
+                    ImGui::Unindent(12.f);
+                }
+                ImGui::Checkbox("Hitmarker", &bHitmarker); ImGui::SameLine(200); ImGui::Checkbox("Kill Feed", &bKillfeed);
+                ImGui::Spacing(); ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "PANIC KEY");
+                ImGui::Spacing();
+                {
+                    static bool waitPanicKey = false;
+                    static DWORD waitPanicStart = 0;
+                    if (waitPanicKey) {
+                        ImGui::TextColored(ImVec4(0.45f,0.70f,1.f,1.f), "Presiona tecla... (ESC cancela)");
+                        if (GetTickCount() - waitPanicStart > 300) {
+                            for (int vk = 0x08; vk < 0xFE; vk++) {
+                                if (vk == VK_LBUTTON || vk == VK_RBUTTON) continue;
+                                if (vk == VK_ESCAPE) { if (GetAsyncKeyState(vk)&0x8000) { waitPanicKey=false; break; } continue; }
+                                if (GetAsyncKeyState(vk)&0x8000) { panicKey=vk; waitPanicKey=false; break; }
+                            }
+                        }
+                    } else {
+                        char pkLabel[64];
+                        snprintf(pkLabel, sizeof(pkLabel), "Tecla panico: %s", VKName(panicKey));
+                        if (ImGui::Button(pkLabel, ImVec2(-1,0))) { waitPanicKey=true; waitPanicStart=GetTickCount(); }
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextColored(bPanicMode ? ImVec4(1.f,0.3f,0.3f,1.f) : ImVec4(0.4f,0.8f,0.4f,1.f),
+                        bPanicMode ? "PANICO" : "");
+                }
                 ImGui::EndTabItem();
             }
 
             // ======= TAB: INFO =======
             if (ImGui::BeginTabItem("  Info  ")) {
                 ImGui::Spacing();
-                // UID del usuario en dorado
-                if (!g_uid.empty()) {
-                    ImGui::TextColored(ImVec4(1.f,0.82f,0.1f,1.f), "ID: %s", g_uid.c_str());
-                    ImGui::Separator();
+
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "ESTADO");
+                ImGui::Spacing();
+                {
+                    ImDrawList* d = ImGui::GetWindowDrawList();
+                    ImVec2 p = ImGui::GetCursorScreenPos();
+                    bool ok = dbgDM && dbgPS && dbgVmSum > 0.f;
+                    d->AddCircleFilled({p.x+6, p.y+8}, 5.f,
+                        ok ? IM_COL32(60,220,100,255) : IM_COL32(220,70,70,255));
+                    ImGui::Indent(18.f);
+                    ImGui::TextColored(ok ? ImVec4(0.40f,0.85f,0.50f,1.f) : ImVec4(0.85f,0.35f,0.35f,1.f),
+                        ok ? "Conectado" : "Desconectado");
+                    ImGui::Unindent(18.f);
                 }
                 ImGui::Spacing();
-                ImGui::TextColored(dbgDM?ImVec4(0.2f,1.f,0.4f,1.f):ImVec4(1.f,0.2f,0.2f,1.f),
-                    "DataModel:  %s", dbgDM?"OK":"FAIL");
-                ImGui::TextColored(dbgPS?ImVec4(0.2f,1.f,0.4f,1.f):ImVec4(1.f,0.2f,0.2f,1.f),
-                    "Players:    %s", dbgPS?"OK":"FAIL");
-                ImGui::TextColored(dbgVmSum>0.f?ImVec4(0.2f,1.f,0.4f,1.f):ImVec4(1.f,0.2f,0.2f,1.f),
-                    "ViewMatrix: %.2f", dbgVmSum);
-                ImGui::Separator();
-                ImGui::Text("Jugadores detectados: %d", dbgPlayers);
-                ImGui::Text("Visibles en pantalla: %d", dbgValid);
-                ImGui::Text("Target aimbot: %s", g_cachedAimTarget?"LOCKED":"---");
-                if (dbgEnemyHp >= 0.f) {
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(1.f,1.f,0.2f,1.f),
-                        "HP enemigo: %.1f / %.1f", dbgEnemyHp, dbgEnemyMaxHp);
-                    ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1.f),
-                        "Off Health: 0x%llX  MaxHP: 0x%llX",
-                        Offsets::Humanoid::Health, Offsets::Humanoid::MaxHealth);
-                }
-                ImGui::Separator();
-                ImGui::TextColored(ImVec4(0.9f,0.8f,0.2f,1.f),
-                    "PlaceId actual: %lld", g_placeId);
-                ImGui::TextColored(ImVec4(0.6f,0.6f,0.8f,1.f),
-                    "Rivals PlaceId: %lld", g_rivalsPlaceId ? g_rivalsPlaceId : 17625359962LL);
-                if (ImGui::Button("Guardar PlaceId actual como Rivals")) {
+                ImGui::TextColored(ImVec4(0.55f,0.58f,0.70f,1.f), "Jugadores: %d", dbgPlayers);
+
+                ImGui::Spacing(); ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "JUEGO");
+                ImGui::Spacing();
+                if (ImGui::Button("Guardar PlaceId como Rivals", ImVec2(-1,0))) {
                     g_rivalsPlaceId = g_placeId;
                     std::ofstream f("ceitus_rivals_placeid.cfg");
                     if (f) f << g_rivalsPlaceId;
                 }
-                ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1.f),
-                    "DM:  %llX", dbgDMAddr);
-                ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1.f),
-                    "PS:  %llX", dbgPSAddr);
-                ImGui::TextColored(ImVec4(0.6f,0.6f,0.6f,1.f),
-                    "Off: %s", g_offsetStatus.c_str());
-                ImGui::Separator();
-                ImGui::Spacing();
-                // ---- version y update ----
-                ImGui::TextColored(ImVec4(0.6f,0.6f,0.8f,1.f), "Version: " CEITUS_VERSION);
-                ImGui::Text("HWID: %s", HWIDString().c_str());
+
+                ImGui::Spacing(); ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.50f,0.52f,0.65f,1.f), "Version: " CEITUS_VERSION);
+
                 if (g_updateAvailable) {
-                    ImGui::TextColored(ImVec4(0.2f,1.f,0.4f,1.f),
-                        "Nueva version: %s", g_latestVersion.c_str());
-                    if (ImGui::Button("Actualizar ahora", ImVec2(-1,0))) {
-                        // descargar en background para no bloquear UI
+                    ImGui::Spacing();
+                    ImGui::PushStyleColor(ImGuiCol_Button,       ImVec4(0.15f,0.50f,0.25f,1.f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f,0.60f,0.35f,1.f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.28f,0.72f,0.42f,1.f));
+                    char updLabel[48]; snprintf(updLabel,sizeof(updLabel),"Actualizar a %s", g_latestVersion.c_str());
+                    if (ImGui::Button(updLabel, ImVec2(-1,0))) {
                         std::thread([](){
                             char exePath[MAX_PATH];
                             GetModuleFileNameA(nullptr, exePath, MAX_PATH);
                             std::string newPath = std::string(exePath) + ".new";
                             if (URLDownloadToFileA(nullptr, URL_EXE, newPath.c_str(), 0, nullptr) == S_OK) {
-                                // bat que reemplaza el exe y reinicia
                                 std::string batPath = std::string(exePath) + "_upd.bat";
                                 std::ofstream bat(batPath);
                                 bat << "@echo off\r\ntimeout /t 2 /nobreak >nul\r\n"
@@ -1629,16 +2106,14 @@ int main() {
                             }
                         }).detach();
                     }
-                } else {
-                    ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1.f), "Version actualizada");
+                    ImGui::PopStyleColor(3);
                 }
-                ImGui::Separator();
+
                 ImGui::Spacing();
-                // binder de tecla del panel
                 static bool waitMenuKey = false;
                 static DWORD waitMenuStart = 0;
                 if (waitMenuKey) {
-                    ImGui::TextColored(ImVec4(1,1,0,1), "Presiona tecla para el panel... (ESC cancela)");
+                    ImGui::TextColored(ImVec4(0.45f,0.70f,1.f,1.f), "Presiona tecla... (ESC cancela)");
                     if (GetTickCount() - waitMenuStart > 300) {
                         for (int vk = 0x08; vk < 0xFE; vk++) {
                             if (vk == VK_LBUTTON || vk == VK_RBUTTON) continue;
@@ -1648,7 +2123,7 @@ int main() {
                     }
                 } else {
                     char mkLabel[64];
-                    snprintf(mkLabel, sizeof(mkLabel), "Tecla panel: 0x%02X", menuKey);
+                    snprintf(mkLabel, sizeof(mkLabel), "Tecla panel: %s", VKName(menuKey));
                     if (ImGui::Button(mkLabel, ImVec2(-1,0))) { waitMenuKey=true; waitMenuStart=GetTickCount(); }
                 }
                 ImGui::EndTabItem();
@@ -1656,6 +2131,7 @@ int main() {
 
             ImGui::EndTabBar();
         }
+        ImGui::EndChild();
         ImGui::End();
 
         ImGui::Render();
@@ -1663,8 +2139,7 @@ int main() {
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_ctx->ClearRenderTargetView(g_rtv, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        g_chain->Present(0, 0);
-        Sleep(6); // cap ~144fps, reduce CPU en PCs lentas
+        g_chain->Present(0, 0); Sleep(1);
 
         // guardar config cada 5 segundos
         static DWORD lastSave = 0;

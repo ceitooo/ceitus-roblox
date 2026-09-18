@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="RbxESP/RbxESP.vcxproj" Id="68ff98ad-468b-4803-876c-4c28d4938bb7" />
+</Solution>

@@ -8,11 +8,20 @@ inline HDC    g_hdc     = nullptr;
 inline HDC    g_memDC   = nullptr;
 inline HBITMAP g_memBmp = nullptr;
 inline HBITMAP g_oldBmp = nullptr;
+inline HBRUSH g_clearBrush = nullptr;
 inline int    g_width   = 1920;
 inline int    g_height  = 1080;
 
 inline LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_PAINT) { PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps); }
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        if (g_memDC)
+            BitBlt(hdc, 0, 0, g_width, g_height, g_memDC, 0, 0, SRCCOPY);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_ERASEBKGND) return 1;
     return DefWindowProcW(h, m, w, l);
 }
 
@@ -44,8 +53,8 @@ inline bool CreateOverlay(HWND target) {
     ShowWindow(g_overlay, SW_SHOW);
     g_hdc   = GetDC(g_overlay);
     g_memDC = CreateCompatibleDC(g_hdc);
+    g_clearBrush = CreateSolidBrush(RGB(0, 0, 0));
     RebuildMemDC();
-    // fuente bold para nombres más visibles
     HFONT fnt = CreateFontA(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
@@ -57,7 +66,8 @@ inline void UpdateOverlayPos(HWND target) {
     RECT cr; GetClientRect(target, &cr);
     POINT pt{ 0, 0 }; ClientToScreen(target, &pt);
     int nw = cr.right - cr.left, nh = cr.bottom - cr.top;
-    SetWindowPos(g_overlay, HWND_TOPMOST, pt.x, pt.y, nw, nh, SWP_NOACTIVATE);
+    SetWindowPos(g_overlay, HWND_TOPMOST, pt.x, pt.y, nw, nh,
+        SWP_NOACTIVATE);
     if (nw != g_width || nh != g_height) {
         g_width = nw; g_height = nh;
         RebuildMemDC();
@@ -66,9 +76,7 @@ inline void UpdateOverlayPos(HWND target) {
 
 inline void ClearOverlay() {
     RECT rc{ 0, 0, g_width, g_height };
-    HBRUSH br = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(g_memDC, &rc, br);
-    DeleteObject(br);
+    FillRect(g_memDC, &rc, g_clearBrush);
 }
 
 inline void PresentOverlay() {
@@ -90,7 +98,6 @@ inline HPEN GetCachedPen(COLORREF col, int width = 1) {
         if (g_penCache[i].pen && g_penCache[i].col == col && g_penCache[i].width == width)
             return g_penCache[i].pen;
     }
-    // evictar el slot más viejo
     int slot = g_penCacheNext % PEN_CACHE_SIZE;
     g_penCacheNext++;
     if (g_penCache[slot].pen) DeleteObject(g_penCache[slot].pen);
@@ -107,10 +114,8 @@ inline void DrawLine(Vector2 a, Vector2 b, COLORREF col, int width = 1) {
     SelectObject(g_memDC, old);
 }
 
-// Punto sólido — siempre visible incluso a larga distancia
 inline void DrawDot(Vector2 center, int r, COLORREF col) {
     HPEN   pen = GetCachedPen(col, 1);
-    // brush no se puede cachear fácil — solo para dots que son pequeños, ok crear/borrar
     HBRUSH br  = CreateSolidBrush(col);
     HBRUSH ob  = (HBRUSH)SelectObject(g_memDC, br);
     HPEN   op  = (HPEN)SelectObject(g_memDC, pen);
@@ -130,13 +135,8 @@ inline void DrawEllipse(Vector2 center, float rx, float ry, COLORREF col) {
     SelectObject(g_memDC, oldP); SelectObject(g_memDC, oldB);
 }
 
-inline void DrawBox(Vector2 topLeft, float w, float h, COLORREF col) {
-    float lx = topLeft.x, ty = topLeft.y;
-    float rx = lx + w,    by = ty + h;
-    float sw = w * 0.25f;
-    float sh = h * 0.25f;
-
-    HPEN old = (HPEN)SelectObject(g_memDC, GetCachedPen(col, 2));
+inline void DrawBoxCorners(float lx, float ty, float rx, float by, float sw, float sh, HPEN pen) {
+    HPEN old = (HPEN)SelectObject(g_memDC, pen);
     MoveToEx(g_memDC,(int)lx,(int)(ty+sh),nullptr); LineTo(g_memDC,(int)lx,(int)ty);
     LineTo(g_memDC,(int)(lx+sw),(int)ty);
     MoveToEx(g_memDC,(int)(rx-sw),(int)ty,nullptr); LineTo(g_memDC,(int)rx,(int)ty);
@@ -148,47 +148,57 @@ inline void DrawBox(Vector2 topLeft, float w, float h, COLORREF col) {
     SelectObject(g_memDC, old);
 }
 
-// Barra de vida a la izquierda de la box
-// top = esquina superior izquierda de la box, h = alto de la box
+inline void DrawBox(Vector2 topLeft, float w, float h, COLORREF col) {
+    float lx = topLeft.x, ty = topLeft.y;
+    float rx = lx + w,    by = ty + h;
+    float sw = w * 0.25f;
+    float sh = h * 0.25f;
+    DrawBoxCorners(lx-1, ty-1, rx+1, by+1, sw+2, sh+2, GetCachedPen(RGB(0,0,0), 3));
+    DrawBoxCorners(lx, ty, rx, by, sw, sh, GetCachedPen(col, 2));
+}
+
 inline void DrawHealthBar(Vector2 top, float h, float healthPct) {
-    float bx  = top.x - 6.f;
+    float bw  = 5.f;
+    float bx  = top.x - bw - 4.f;
     float by  = top.y;
     float bby = top.y + h;
     float filled = by + h * (1.f - healthPct);
 
-    // fondo gris
-    HBRUSH bgBr = CreateSolidBrush(RGB(60,60,60));
-    RECT bgRc = { (int)bx, (int)by, (int)(bx+4), (int)bby };
+    HBRUSH borderBr = CreateSolidBrush(RGB(0,0,0));
+    RECT borderRc = { (int)(bx-1), (int)(by-1), (int)(bx+bw+1), (int)(bby+1) };
+    FillRect(g_memDC, &borderRc, borderBr); DeleteObject(borderBr);
+
+    HBRUSH bgBr = CreateSolidBrush(RGB(30,30,30));
+    RECT bgRc = { (int)bx, (int)by, (int)(bx+bw), (int)bby };
     FillRect(g_memDC, &bgRc, bgBr); DeleteObject(bgBr);
 
-    // barra de vida rojo→verde
-    int r = (int)(255*(1.f-healthPct));
-    int g = (int)(255*healthPct);
+    int r, g;
+    if (healthPct > 0.5f) {
+        float t = (healthPct - 0.5f) * 2.f;
+        r = (int)(255 * (1.f - t)); g = 255;
+    } else {
+        float t = healthPct * 2.f;
+        r = 255; g = (int)(255 * t);
+    }
     HBRUSH hpBr = CreateSolidBrush(RGB(r,g,0));
-    RECT hpRc = { (int)bx, (int)filled, (int)(bx+4), (int)bby };
+    RECT hpRc = { (int)bx, (int)filled, (int)(bx+bw), (int)bby };
     FillRect(g_memDC, &hpRc, hpBr); DeleteObject(hpBr);
 }
 
-// Texto centrado horizontalmente con outline negro para visibilidad
 inline void DrawText2D(Vector2 pos, const std::string& txt, COLORREF col) {
     if (txt.empty()) return;
     SetBkMode(g_memDC, TRANSPARENT);
     int len = (int)txt.size();
-    // medir ancho del texto para centrarlo
     SIZE sz{};
     GetTextExtentPoint32A(g_memDC, txt.c_str(), len, &sz);
     int x = (int)pos.x - sz.cx / 2;
     int y = (int)pos.y;
-    // outline negro (4 direcciones)
     SetTextColor(g_memDC, RGB(0,0,0));
-    for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++)
-        if (dx || dy) TextOutA(g_memDC, x+dx, y+dy, txt.c_str(), len);
-    // texto principal
+    TextOutA(g_memDC, x+1, y+1, txt.c_str(), len);
     SetTextColor(g_memDC, col);
     TextOutA(g_memDC, x, y, txt.c_str(), len);
 }
 
-// Fondo relleno semitransparente para el radar (SRCCOPY no soporta alpha, usamos color oscuro)
 inline void DrawFilledCircleBG(Vector2 center, float r) {
     HBRUSH br = CreateSolidBrush(RGB(15, 15, 25));
     HPEN   pn = CreatePen(PS_SOLID, 2, RGB(80, 80, 120));
@@ -200,7 +210,6 @@ inline void DrawFilledCircleBG(Vector2 center, float r) {
     DeleteObject(br); DeleteObject(pn);
 }
 
-// Cruz de referencia en el radar
 inline void DrawRadarCross(Vector2 center, float r) {
     HPEN pen = CreatePen(PS_SOLID, 1, RGB(50, 50, 80));
     HPEN old = (HPEN)SelectObject(g_memDC, pen);
