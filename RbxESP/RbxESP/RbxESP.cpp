@@ -29,7 +29,7 @@
 #include <mutex>
 
 // ---- versión actual ----
-#define CEITUS_VERSION "1.0.2"
+#define CEITUS_VERSION "1.0.5"
 
 // ---- URLs GitHub (reemplazar USER/REPO con tu repo real) ----
 #define GITHUB_USER      "ceitooo"
@@ -289,6 +289,9 @@ bool  bHitmarker = false;
 bool  bKillfeed  = false;
 bool  bChams     = false;
 bool  bAntiAFK  = false;
+bool  bUserFilter = false; // solo mostrar ESP de usuarios específicos
+std::vector<std::string> g_targetUsers; // lista de usernames objetivo
+char  g_targetUserInput[64] = "";       // buffer para input de nuevo user
 
 // hitmarker state
 static DWORD g_hitmarkerTime = 0;
@@ -645,6 +648,13 @@ static void AimbotThread() {
                     bool aMate = (localTeam > 0x10000000000ULL && pTeam > 0x10000000000ULL && pTeam == localTeam);
                     if (bAimbotTeamFilter && aMate) continue;
 
+                    if (bUserFilter && !g_targetUsers.empty()) {
+                        std::string pn = GetInstanceName(player);
+                        bool found = false;
+                        for (auto& u : g_targetUsers) if (_stricmp(pn.c_str(), u.c_str()) == 0) { found = true; break; }
+                        if (!found) continue;
+                    }
+
                     uintptr_t chr = mem.Read<uintptr_t>(player + Offsets::Player::ModelInstance);
                     if (!chr) continue;
                     // no re-adquirir al mismo JUGADOR durante 1.5 segundos tras su muerte
@@ -765,13 +775,12 @@ static void AimbotThread() {
             accumX = 0.f; accumY = 0.f;
         }
         if (keyHeld) {
-            if (dist < 0.5f) continue; // deadzone mínimo
+            if (dist < 0.3f) continue; // deadzone mínimo
 
-            // gain no-lineal: más agresivo cuando está cerca, suave cuando está lejos
-            float baseGain = std::clamp(fAimSmooth / 300.f, 0.02f, 0.30f);
-            // boost cuando está cerca del target (< 30px)
-            float distFactor = (dist < 30.f) ? 1.5f : (dist < 80.f ? 1.2f : 1.0f);
-            float gain = baseGain * distFactor;
+            float baseGain = std::clamp(fAimSmooth / 350.f, 0.02f, 0.25f);
+            // gain proporcional: más suave cuando está cerca para no oscilar
+            float t = std::clamp(dist / 120.f, 0.15f, 1.0f);
+            float gain = baseGain * t;
 
             accumX += dx * gain; accumY += dy * gain;
             LONG mx = (LONG)accumX, my = (LONG)accumY;
@@ -856,6 +865,14 @@ static void ESPScanThread() {
             uintptr_t pTeam = mem.Read<uintptr_t>(player + Offsets::Player::Team);
             bool isTeammate = (localTeam > 0x10000000000ULL && pTeam > 0x10000000000ULL && pTeam == localTeam);
             if (bTeamFilter && multiTeam && isTeammate) continue;
+
+            if (bUserFilter && !g_targetUsers.empty()) {
+                bool found = false;
+                for (auto& u : g_targetUsers) {
+                    if (_stricmp(pi.name.c_str(), u.c_str()) == 0) { found = true; break; }
+                }
+                if (!found) continue;
+            }
 
             CachedPlayerESP ce{};
             ce.pos       = pi.pos;
@@ -1037,7 +1054,10 @@ static void SaveConfig(int mode = -1) {
       << bCrosshair << "\n" << iCrosshairStyle << "\n"
       << bHitmarker << "\n" << bKillfeed << "\n" << bChams << "\n"
       << panicKey << "\n"
-      << bAntiAFK << "\n";
+      << bAntiAFK << "\n"
+      << bUserFilter << "\n"
+      << (int)g_targetUsers.size() << "\n";
+    for (auto& u : g_targetUsers) f << u << "\n";
 }
 
 static void LoadConfig(int mode = -1) {
@@ -1069,6 +1089,14 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) f >> bChams;
     if (!f.eof()) f >> panicKey;
     if (!f.eof()) f >> bAntiAFK;
+    if (!f.eof()) f >> bUserFilter;
+    { int cnt = 0; if (!f.eof()) f >> cnt;
+      g_targetUsers.clear();
+      for (int i = 0; i < cnt && !f.eof(); i++) {
+          std::string u; f >> u;
+          if (!u.empty()) g_targetUsers.push_back(u);
+      }
+    }
     // clamp para evitar valores absurdos de configs viejas
     if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
     if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
@@ -1924,6 +1952,26 @@ int main() {
           ImGui::Combo("##modo", &gameMode, gameModeNames, 5);
           if (gameMode != prev) { SaveConfig(prev); LoadConfig(gameMode); } }
         ImGui::Checkbox("Ignorar equipo", &bTeamFilter);
+        ImGui::Checkbox("Solo usuarios especificos", &bUserFilter);
+        if (bUserFilter) {
+            ImGui::Indent(10.f);
+            ImGui::InputText("##adduser", g_targetUserInput, sizeof(g_targetUserInput));
+            ImGui::SameLine();
+            if (ImGui::Button("Agregar") && g_targetUserInput[0]) {
+                bool dup = false;
+                for (auto& u : g_targetUsers) if (_stricmp(u.c_str(), g_targetUserInput) == 0) { dup = true; break; }
+                if (!dup) g_targetUsers.push_back(g_targetUserInput);
+                g_targetUserInput[0] = '\0';
+            }
+            for (int i = 0; i < (int)g_targetUsers.size(); i++) {
+                ImGui::Text("%s", g_targetUsers[i].c_str());
+                ImGui::SameLine();
+                char btnId[32]; snprintf(btnId, sizeof(btnId), "X##del%d", i);
+                if (ImGui::SmallButton(btnId)) { g_targetUsers.erase(g_targetUsers.begin()+i); i--; }
+            }
+            if (g_targetUsers.empty()) ImGui::TextDisabled("Sin usuarios, se muestran todos");
+            ImGui::Unindent(10.f);
+        }
         ImGui::Spacing();
 
         // ---- tabs ----
