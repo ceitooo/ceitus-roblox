@@ -288,6 +288,7 @@ int   iCrosshairStyle = 0; // 0=Cruz, 1=Punto, 2=Cruz+Punto
 bool  bHitmarker = false;
 bool  bKillfeed  = false;
 bool  bChams     = false;
+bool  bAntiAFK  = false;
 
 // hitmarker state
 static DWORD g_hitmarkerTime = 0;
@@ -533,33 +534,32 @@ static void AimbotThread() {
     while (true) {
         Sleep(8);
 
-        // ---- bunny hop (escribe Humanoid.Jump directamente en memoria) ----
+        // ---- bunny hop (usa punteros cacheados del ESP thread) ----
         if (bBhop && (GetAsyncKeyState(VK_SPACE) & 0x8000)) {
-            uintptr_t dm = GetDataModel();
-            uintptr_t ps = dm ? GetPlayersService(dm) : 0;
-            uintptr_t lp = ps ? GetLocalPlayer(ps) : 0;
-            if (lp) {
-                uintptr_t lchar = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
-                if (lchar) {
-                    uintptr_t lhum = FindFirstChild(lchar, "Humanoid");
-                    if (lhum) {
-                        uintptr_t lhrp = mem.Read<uintptr_t>(lhum + Offsets::Humanoid::HumanoidRootPart);
-                        if (!lhrp) lhrp = FindFirstChild(lchar, "HumanoidRootPart");
-                        if (lhrp) {
-                            uintptr_t prim = mem.Read<uintptr_t>(lhrp + Offsets::BasePart::Primitive);
-                            if (prim) {
-                                float vy = mem.Read<float>(prim + Offsets::Primitive::AssemblyLinearVelocity + 4);
-                                // vy ~0 = en el suelo. Escribir Jump=true directo en memoria
-                                if (fabsf(vy) < 1.5f) {
-                                    uint8_t jmp = 1;
-                                    WriteProcessMemory(mem.proc,
-                                        (LPVOID)(lhum + Offsets::Humanoid::Jump),
-                                        &jmp, 1, nullptr);
-                                }
-                                lastHumState = (vy < -2.f) ? 1 : 0;
-                            }
-                        }
+            static uintptr_t bhopHum = 0, bhopHRP = 0;
+            static DWORD bhopScan = 0;
+            DWORD bnow = GetTickCount();
+            if (bnow - bhopScan > 200 || !bhopHum) {
+                bhopScan = bnow;
+                uintptr_t lp = g_cachedLp;
+                if (lp) {
+                    uintptr_t lchar = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
+                    if (lchar) {
+                        bhopHum = FindFirstChild(lchar, "Humanoid");
+                        bhopHRP = bhopHum ? mem.Read<uintptr_t>(bhopHum + Offsets::Humanoid::HumanoidRootPart) : 0;
+                        if (!bhopHRP && lchar) bhopHRP = FindFirstChild(lchar, "HumanoidRootPart");
                     }
+                }
+            }
+            if (bhopHum && bhopHRP) {
+                uintptr_t prim = mem.Read<uintptr_t>(bhopHRP + Offsets::BasePart::Primitive);
+                if (prim) {
+                    float vy = mem.Read<float>(prim + Offsets::Primitive::AssemblyLinearVelocity + 4);
+                    if (fabsf(vy) < 1.5f) {
+                        uint8_t jmp = 1;
+                        WriteProcessMemory(mem.proc, (LPVOID)(bhopHum + Offsets::Humanoid::Jump), &jmp, 1, nullptr);
+                    }
+                    lastHumState = (vy < -2.f) ? 1 : 0;
                 }
             }
         } else { lastHumState = 0; }
@@ -765,10 +765,13 @@ static void AimbotThread() {
             accumX = 0.f; accumY = 0.f;
         }
         if (keyHeld) {
-            if (dist < 1.5f) continue; // deadzone mínimo
+            if (dist < 0.5f) continue; // deadzone mínimo
 
-            // gain lineal: 1=muy lento, 80=max (>80 oscila por sensibilidad del juego)
-            float gain = std::clamp(fAimSmooth / 400.f, 0.01f, 0.20f);
+            // gain no-lineal: más agresivo cuando está cerca, suave cuando está lejos
+            float baseGain = std::clamp(fAimSmooth / 300.f, 0.02f, 0.30f);
+            // boost cuando está cerca del target (< 30px)
+            float distFactor = (dist < 30.f) ? 1.5f : (dist < 80.f ? 1.2f : 1.0f);
+            float gain = baseGain * distFactor;
 
             accumX += dx * gain; accumY += dy * gain;
             LONG mx = (LONG)accumX, my = (LONG)accumY;
@@ -1033,7 +1036,8 @@ static void SaveConfig(int mode = -1) {
       << iAimBone << "\n"
       << bCrosshair << "\n" << iCrosshairStyle << "\n"
       << bHitmarker << "\n" << bKillfeed << "\n" << bChams << "\n"
-      << panicKey << "\n";
+      << panicKey << "\n"
+      << bAntiAFK << "\n";
 }
 
 static void LoadConfig(int mode = -1) {
@@ -1064,10 +1068,11 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) f >> bKillfeed;
     if (!f.eof()) f >> bChams;
     if (!f.eof()) f >> panicKey;
+    if (!f.eof()) f >> bAntiAFK;
     // clamp para evitar valores absurdos de configs viejas
     if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
     if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
-    if (fAimSmooth > 80.f || fAimSmooth < 0.1f) fAimSmooth = 60.f;
+    if (fAimSmooth > 100.f || fAimSmooth < 0.1f) fAimSmooth = 60.f;
 }
 
 int main() {
@@ -1194,6 +1199,29 @@ int main() {
             }
             lastPanicKey = curPanic;
         }
+        // anti-AFK: simula input cada ~60s para que Roblox no te saque
+        if (bAntiAFK && rbxWnd) {
+            static DWORD lastAfk = 0;
+            DWORD nowAfk = GetTickCount();
+            if (nowAfk - lastAfk > 60000) {
+                lastAfk = nowAfk;
+                PostMessage(rbxWnd, WM_KEYDOWN, VK_F13, 0);
+                PostMessage(rbxWnd, WM_KEYUP,   VK_F13, 0);
+            }
+        }
+
+        // re-forzar topmost del menú cada 2s para que no quede detrás
+        {
+            static DWORD lastTopmost = 0;
+            DWORD nowT = GetTickCount();
+            if (nowT - lastTopmost > 2000) {
+                lastTopmost = nowT;
+                if (IsWindowVisible(menuWnd))
+                    SetWindowPos(menuWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+
         if (bPanicMode) {
             g_chain->Present(0, 0); Sleep(16);
             continue;
@@ -1960,7 +1988,7 @@ int main() {
                     ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Dist max (m)", &fAimMaxDist,  30.f, 1000000.f, "%.0f", ImGuiSliderFlags_Logarithmic);
                     ImGui::SetNextItemWidth(200.f);
-                    ImGui::SliderFloat("Velocidad",    &fAimSmooth,    1.f,   80.f, "%.0f%%");
+                    ImGui::SliderFloat("Velocidad",    &fAimSmooth,    1.f,  100.f, "%.0f%%");
                     static const char* aimBoneNames[] = { "Cabeza", "Cuello", "Pecho" };
                     ImGui::SetNextItemWidth(200.f);
                     ImGui::Combo("Aimlock", &iAimBone, aimBoneNames, 3);
@@ -2011,6 +2039,7 @@ int main() {
                     ImGui::Unindent(12.f);
                 }
                 ImGui::Checkbox("Bunny Hop [Space]", &bBhop);
+                ImGui::Checkbox("Anti-AFK", &bAntiAFK);
                 ImGui::Spacing(); ImGui::Spacing();
                 ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "HUD");
                 ImGui::Spacing();
@@ -2139,7 +2168,25 @@ int main() {
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_ctx->ClearRenderTargetView(g_rtv, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        g_chain->Present(0, 0); Sleep(1);
+        HRESULT hr = g_chain->Present(0, 0);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            ImGui_ImplDX11_Shutdown();
+            if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
+            if (g_chain) { g_chain->Release(); g_chain = nullptr; }
+            if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
+            if (g_dev) { g_dev->Release(); g_dev = nullptr; }
+            DXGI_SWAP_CHAIN_DESC sd2{};
+            sd2.BufferCount = 2; sd2.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            sd2.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd2.OutputWindow = menuWnd;
+            sd2.SampleDesc.Count = 1; sd2.Windowed = TRUE; sd2.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+            D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                nullptr, 0, D3D11_SDK_VERSION, &sd2, &g_chain, &g_dev, nullptr, &g_ctx);
+            ID3D11Texture2D* buf2 = nullptr;
+            g_chain->GetBuffer(0, IID_PPV_ARGS(&buf2));
+            g_dev->CreateRenderTargetView(buf2, nullptr, &g_rtv); buf2->Release();
+            ImGui_ImplDX11_Init(g_dev, g_ctx);
+        }
+        Sleep(1);
 
         // guardar config cada 5 segundos
         static DWORD lastSave = 0;
