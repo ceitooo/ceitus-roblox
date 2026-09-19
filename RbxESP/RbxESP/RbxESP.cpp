@@ -151,6 +151,7 @@ static std::string HttpPostJSON(const wchar_t* host, const wchar_t* path, const 
 static std::atomic<bool> g_updateAvailable{ false };
 static std::atomic<bool> g_hwIdBanned{ false };
 static std::string       g_latestVersion;
+static bool              g_showUpdatePopup = false;
 
 // ---- sistema de keys ----
 enum class LoginState { KeyInput, LoggedIn };
@@ -251,6 +252,7 @@ static void NetworkThread() {
     if (!latest.empty() && latest != CEITUS_VERSION) {
         g_latestVersion = latest;
         g_updateAvailable = true;
+        g_showUpdatePopup = true;
     }
 }
 
@@ -2210,6 +2212,45 @@ int main() {
         }
         ImGui::EndChild();
         ImGui::End();
+
+        // popup de actualización disponible
+        if (g_showUpdatePopup) {
+            ImGui::OpenPopup("##updatepopup");
+            g_showUpdatePopup = false;
+        }
+        if (ImGui::BeginPopupModal("##updatepopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.30f,0.70f,0.40f,1.f), "Nueva actualizacion disponible!");
+            ImGui::Spacing();
+            char msg[64]; snprintf(msg, sizeof(msg), "Version actual: " CEITUS_VERSION "  ->  %s", g_latestVersion.c_str());
+            ImGui::Text("%s", msg);
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+            if (ImGui::Button("Actualizar ahora", ImVec2(200,0))) {
+                ImGui::CloseCurrentPopup();
+                std::thread([](){
+                    char exePath[MAX_PATH];
+                    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+                    std::string newPath = std::string(exePath) + ".new";
+                    if (URLDownloadToFileA(nullptr, URL_EXE, newPath.c_str(), 0, nullptr) == S_OK) {
+                        std::string batPath = std::string(exePath) + "_upd.bat";
+                        std::ofstream bat(batPath);
+                        bat << "@echo off\r\ntimeout /t 2 /nobreak >nul\r\n"
+                            << "move /y \"" << newPath << "\" \"" << exePath << "\"\r\n"
+                            << "start \"\" \"" << exePath << "\"\r\n"
+                            << "del \"%~f0\"\r\n";
+                        bat.close();
+                        ShellExecuteA(nullptr,"open",batPath.c_str(),nullptr,nullptr,SW_HIDE);
+                        ExitProcess(0);
+                    }
+                }).detach();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Mas tarde", ImVec2(120,0))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Spacing();
+            ImGui::EndPopup();
+        }
 
         ImGui::Render();
         const float clear[4]{};
