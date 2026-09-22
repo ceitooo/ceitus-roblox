@@ -38,6 +38,7 @@
 #define GITHUB_USER      "ceitooo"
 #define GITHUB_REPO      "ceitus-roblox"
 #define URL_VERSION      "https://raw.githubusercontent.com/" GITHUB_USER "/" GITHUB_REPO "/main/version.txt"
+#define URL_MIN_VERSION  "https://raw.githubusercontent.com/" GITHUB_USER "/" GITHUB_REPO "/main/min_version.txt"
 #define URL_BANNED_HWIDS "https://raw.githubusercontent.com/" GITHUB_USER "/" GITHUB_REPO "/main/banned.txt"
 #define URL_EXE          "https://github.com/" GITHUB_USER "/" GITHUB_REPO "/releases/latest/download/RbxESP.exe"
 
@@ -113,6 +114,16 @@ static std::string HttpPostJSON(const wchar_t* host, const wchar_t* path, const 
     }
     WinHttpCloseHandle(hReq); WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes);
     return result;
+}
+
+// compara versiones "X.Y.Z" — retorna true si a >= b
+static bool VersionGTE(const std::string& a, const std::string& b) {
+    int a0=0,a1=0,a2=0, b0=0,b1=0,b2=0;
+    sscanf_s(a.c_str(), "%d.%d.%d", &a0, &a1, &a2);
+    sscanf_s(b.c_str(), "%d.%d.%d", &b0, &b1, &b2);
+    if (a0 != b0) return a0 > b0;
+    if (a1 != b1) return a1 > b1;
+    return a2 >= b2;
 }
 
 // ---- estado de update y ban ----
@@ -236,11 +247,17 @@ static void NetworkThread() {
         }
     }
 
-    std::string latest = HttpGet(URL_VERSION);
-    if (!latest.empty() && latest != CEITUS_VERSION) {
-        g_latestVersion = latest;
-        g_updateAvailable = true;
-        g_showUpdatePopup = true;
+    // solo recibir actualizaciones si esta version >= min_version requerida
+    std::string minVer = HttpGet(URL_MIN_VERSION);
+    bool eligible = minVer.empty() || VersionGTE(CEITUS_VERSION, minVer);
+
+    if (eligible) {
+        std::string latest = HttpGet(URL_VERSION);
+        if (!latest.empty() && latest != CEITUS_VERSION) {
+            g_latestVersion = latest;
+            g_updateAvailable = true;
+            g_showUpdatePopup = true;
+        }
     }
 }
 
