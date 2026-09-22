@@ -258,7 +258,7 @@ inline bool SecurityCheck() {
     if (CheckNtDebug())           return false;
     if (CheckHeapFlags())         return false;
     if (CheckHWBreakpoints())     return false;
-    if (CheckCPUID_VM())          return false;
+    // CheckCPUID_VM() removido: Windows 11 VBS/HVCI setea el hypervisor bit en hardware real
     if (CheckVMRegistry())        return false;
     if (CheckVMProcesses())       return false;
     if (CheckReversingTools())    return false;

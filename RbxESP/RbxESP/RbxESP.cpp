@@ -1164,9 +1164,9 @@ int main() {
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"CeitusRbxESP_Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(hMutex); return 0; }
 
-    // ocultar thread del debugger y borrar PE header
+    // ocultar thread del debugger
     HideThreadFromDebugger();
-    ErasePEHeader();
+    // ErasePEHeader() removido: Windows 11 CFG necesita el PE header para crear threads
 
     // inicializar checksum del .text para detectar patches en runtime
     InitChecksum();
