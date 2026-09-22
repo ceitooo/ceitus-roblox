@@ -120,6 +120,7 @@ static std::atomic<bool> g_updateAvailable{ false };
 static std::atomic<bool> g_hwIdBanned{ false };
 static std::string       g_latestVersion;
 static bool              g_showUpdatePopup = false;
+static std::atomic<bool> g_canUpdate{ false }; // solo keys con "canUpdate":true en backend
 
 // ---- sistema de keys ----
 enum class LoginState { KeyInput, LoggedIn };
@@ -198,6 +199,9 @@ static int CheckKeyOnline(const std::string& key) {
         }
         return -1;
     }
+    // key con permiso de actualizar (solo para la key oficial del owner)
+    if (resp.find("\"canUpdate\":true") != std::string::npos)
+        g_canUpdate = true;
     auto pos = resp.find("\"daysLeft\":");
     if (pos == std::string::npos) return 0;
     pos += 11;
@@ -213,6 +217,14 @@ static std::atomic<bool> g_checkOk{ false };
 static void NetworkThread() {
     Sleep(2000);
     std::string hwidStr = HWIDString();
+
+    // ping al backend: registra este HWID apenas arranca el exe
+    {
+        std::string pingBody = ESTR("{\"action\":\"ceitus-ping\",\"hwid\":\"") + hwidStr + ESTR("\"}");
+        std::wstring host = EWSTR("ceitotweaks-backend.vercel.app");
+        std::wstring path = EWSTR("/api/owner-stats");
+        HttpPostJSON(host.c_str(), path.c_str(), pingBody); // fire and forget
+    }
 
     std::string banned = HttpGet(URL_BANNED_HWIDS);
     if (!banned.empty()) {
@@ -382,6 +394,7 @@ bool  bTeamFilter = false;
 const char* gameModeNames[] = { "General", "Counterblox", "Duels", "Arsenal", "Rivals" };
 
 // shared state entre threads
+static HWND  g_rbxWnd = nullptr; // ventana de Roblox (global para threads)
 ViewMatrix_t lastVm{};
 uintptr_t    lastPs = 0;
 uintptr_t    g_cachedAimTarget = 0; // target actual del aimbot (para FOV dinámico)
@@ -551,34 +564,39 @@ static void AimbotThread() {
     while (true) {
         Sleep(8);
 
-        // ---- bunny hop (usa punteros cacheados del ESP thread) ----
+        // ---- bunny hop: envía espacio al window de Roblox en el momento de tocar el suelo ----
         if (bBhop && (GetAsyncKeyState(VK_SPACE) & 0x8000)) {
-            static uintptr_t bhopHum = 0, bhopHRP = 0;
+            static uintptr_t bhopHRP = 0;
             static DWORD bhopScan = 0;
+            static bool wasInAir = false;
             DWORD bnow = GetTickCount();
-            if (bnow - bhopScan > 200 || !bhopHum) {
+            if (bnow - bhopScan > 300 || !bhopHRP) {
                 bhopScan = bnow;
                 uintptr_t lp = g_cachedLp;
                 if (lp) {
                     uintptr_t lchar = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
                     if (lchar) {
-                        bhopHum = FindFirstChild(lchar, "Humanoid");
-                        bhopHRP = bhopHum ? mem.Read<uintptr_t>(bhopHum + Offsets::Humanoid::HumanoidRootPart) : 0;
-                        if (!bhopHRP && lchar) bhopHRP = FindFirstChild(lchar, "HumanoidRootPart");
+                        uintptr_t lhum = FindFirstChild(lchar, "Humanoid");
+                        bhopHRP = lhum ? mem.Read<uintptr_t>(lhum + Offsets::Humanoid::HumanoidRootPart) : 0;
+                        if (!bhopHRP) bhopHRP = FindFirstChild(lchar, "HumanoidRootPart");
                     }
                 }
             }
-            if (bhopHum && bhopHRP) {
+            bool onGround = false;
+            if (bhopHRP) {
                 uintptr_t prim = mem.Read<uintptr_t>(bhopHRP + Offsets::BasePart::Primitive);
                 if (prim) {
                     float vy = mem.Read<float>(prim + Offsets::Primitive::AssemblyLinearVelocity + 4);
-                    if (fabsf(vy) < 1.5f) {
-                        uint8_t jmp = 1;
-                        WriteProcessMemory(mem.proc, (LPVOID)(bhopHum + Offsets::Humanoid::Jump), &jmp, 1, nullptr);
-                    }
+                    onGround = fabsf(vy) < 2.f;
                     lastHumState = (vy < -2.f) ? 1 : 0;
                 }
             }
+            // enviar salto al window de Roblox cuando toca el suelo (flanco bajada→suelo)
+            if (onGround && wasInAir && g_rbxWnd) {
+                PostMessage(g_rbxWnd, WM_KEYDOWN, VK_SPACE, 0x00390001);
+                PostMessage(g_rbxWnd, WM_KEYUP,   VK_SPACE, 0xC0390001);
+            }
+            wasInAir = !onGround;
         } else { lastHumState = 0; }
 
         if (!bAimbot && !bTriggerbot) {
@@ -938,29 +956,30 @@ static void ESPScanThread() {
         }
         // detectar hits y kills comparando health con snapshot anterior
         if (bHitmarker || bKillfeed) {
+            DWORD nowHK = GetTickCount();
+            // hits: bajó la vida de un jugador que sigue vivo
             for (auto& ce : newCache) {
                 for (auto& old : oldSnap) {
-                    if (old.character == ce.character && old.health > 0.f) {
-                        if (ce.health < old.health && ce.health >= 0.f) {
-                            if (bHitmarker) g_hitmarkerTime = GetTickCount();
-                            if (bKillfeed && ce.health <= 0.f) {
-                                g_killfeed.push_back({ ce.name, GetTickCount() });
-                            }
-                        }
-                        break;
+                    if (old.character != ce.character) continue;
+                    if (old.health > 0.f && ce.health < old.health - 0.5f) {
+                        if (bHitmarker) g_hitmarkerTime = nowHK;
                     }
+                    break;
                 }
             }
-            // detectar kills: jugador que estaba en oldSnap pero no en newCache
+            // kills: jugador con vida > 0 que ya no aparece en el nuevo cache
             if (bKillfeed) {
                 for (auto& old : oldSnap) {
-                    if (old.health <= 0.f) continue;
-                    bool found = false;
-                    for (auto& ce : newCache) {
-                        if (ce.character == old.character) { found = true; break; }
-                    }
-                    if (!found) {
-                        g_killfeed.push_back({ old.name, GetTickCount() });
+                    if (old.health <= 0.f || old.name.empty()) continue;
+                    bool still = false;
+                    for (auto& ce : newCache)
+                        if (ce.character == old.character) { still = true; break; }
+                    if (!still) {
+                        // evitar duplicados rápidos del mismo nombre
+                        bool dup = false;
+                        for (auto& kf : g_killfeed)
+                            if (kf.name == old.name && nowHK - kf.time < 2000) { dup = true; break; }
+                        if (!dup) g_killfeed.push_back({ old.name, nowHK });
                     }
                 }
             }
@@ -1166,7 +1185,7 @@ int main() {
     // hilo de red: ban check + version check (en background, no bloquea)
     std::thread(NetworkThread).detach();
 
-    HWND rbxWnd = nullptr;
+    HWND& rbxWnd = g_rbxWnd;
 
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc = WndProc; wc.lpszClassName = L"RbxMenu"; wc.hInstance = GetModuleHandleW(nullptr);
@@ -1256,14 +1275,16 @@ int main() {
             }
             lastPanicKey = curPanic;
         }
-        // anti-AFK: simula input cada ~60s para que Roblox no te saque
-        if (bAntiAFK && rbxWnd) {
+        // anti-AFK: micro-movimiento de mouse cada 55s (funciona en segundo plano, sin foco)
+        if (bAntiAFK) {
             static DWORD lastAfk = 0;
             DWORD nowAfk = GetTickCount();
-            if (nowAfk - lastAfk > 60000) {
+            if (nowAfk - lastAfk > 55000) {
                 lastAfk = nowAfk;
-                PostMessage(rbxWnd, WM_KEYDOWN, VK_F13, 0);
-                PostMessage(rbxWnd, WM_KEYUP,   VK_F13, 0);
+                INPUT inp[2]{};
+                inp[0].type = INPUT_MOUSE; inp[0].mi.dwFlags = MOUSEEVENTF_MOVE; inp[0].mi.dx = 1;  inp[0].mi.dy = 0;
+                inp[1].type = INPUT_MOUSE; inp[1].mi.dwFlags = MOUSEEVENTF_MOVE; inp[1].mi.dx = -1; inp[1].mi.dy = 0;
+                SendInput(2, inp, sizeof(INPUT));
             }
         }
 
@@ -2188,7 +2209,7 @@ int main() {
                 ImGui::Spacing(); ImGui::Spacing();
                 ImGui::TextColored(ImVec4(0.50f,0.52f,0.65f,1.f), "Version: " CEITUS_VERSION);
 
-                if (g_updateAvailable) {
+                if (g_updateAvailable && g_canUpdate) {
                     ImGui::Spacing();
                     ImGui::PushStyleColor(ImGuiCol_Button,       ImVec4(0.15f,0.50f,0.25f,1.f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f,0.60f,0.35f,1.f));
@@ -2297,10 +2318,12 @@ int main() {
         ImGui::EndChild();
         ImGui::End();
 
-        // popup de actualización disponible
-        if (g_showUpdatePopup) {
+        // popup de actualización disponible (solo para keys con canUpdate:true)
+        if (g_showUpdatePopup && g_canUpdate) {
             ImGui::OpenPopup("##updatepopup");
             g_showUpdatePopup = false;
+        } else if (g_showUpdatePopup) {
+            g_showUpdatePopup = false; // descartar silenciosamente para keys normales
         }
         if (ImGui::BeginPopupModal("##updatepopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
             ImGui::Spacing();
