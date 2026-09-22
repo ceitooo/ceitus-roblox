@@ -4,7 +4,10 @@
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "comdlg32.lib")
+#include "Security.hpp"
 #include "Memory.hpp"
+#include <commdlg.h>
 #include "Math.hpp"
 #include "ESP.hpp"
 #include "Overlay.hpp"
@@ -59,26 +62,28 @@ static uint32_t GetHWID() {
 
 // ---- Anti-Debugging & Seguridad ----
 static bool PerformSecurityCheck() {
+    // 1. IsDebuggerPresent básico
     if (IsDebuggerPresent()) return false;
 
+    // 2. Remote debugger
     BOOL isRemoteDebugger = FALSE;
     if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &isRemoteDebugger) && isRemoteDebugger)
         return false;
 
-    typedef NTSTATUS(NTAPI* pfnNtQueryInformationProcess)(
-        HANDLE ProcessHandle, ULONG ProcessInformationClass,
-        PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength
-    );
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll) {
-        pfnNtQueryInformationProcess NtQueryInfo =
-            (pfnNtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
-        if (NtQueryInfo) {
-            DWORD_PTR debugPort = 0;
-            NTSTATUS status = NtQueryInfo(GetCurrentProcess(), 7, &debugPort, sizeof(debugPort), NULL);
-            if (status == 0 && debugPort != 0) return false;
-        }
-    }
+    // 3. NtQueryInformationProcess — debug port
+    if (CheckNtDebug()) return false;
+
+    // 4. Heap flags — Cheat Engine/OllyDbg dejan rastros
+    if (CheckHeapFlags()) return false;
+
+    // 5. Hardware breakpoints DR0-DR3
+    if (CheckHWBreakpoints()) return false;
+
+    // 6. VM detection
+    if (CheckCPUID_VM())    return false;
+    if (CheckVMRegistry())  return false;
+    if (CheckVMProcesses()) return false;
+
     return true;
 }
 
@@ -173,7 +178,7 @@ static std::string MakeUID(const std::string& key, uint32_t hwid) {
     return buf;
 }
 
-static std::string LicensePath() { return "ceitus_license.cfg"; }
+static std::string LicensePath() { return ESTR("ceitus_license.cfg"); }
 
 static std::string TodayStr() {
     time_t now = time(nullptr);
@@ -210,8 +215,10 @@ static bool LoadLicense(std::string& keyOut) {
 // Verificar key en backend. Retorna: 0=permanente, >0=dias, -1=invalida, -2=canjeada por otro
 static int CheckKeyOnline(const std::string& key) {
     std::string hwidStr = HWIDString();
-    std::string body = "{\"action\":\"ceitus-verify\",\"key\":\"" + key + "\",\"hwid\":\"" + hwidStr + "\"}";
-    std::string resp = HttpPostJSON(L"ceitotweaks-backend.vercel.app", L"/api/owner-stats", body);
+    std::string body = ESTR("{\"action\":\"ceitus-verify\",\"key\":\"") + key + ESTR("\",\"hwid\":\"") + hwidStr + ESTR("\"}");
+    std::wstring host = EWSTR("ceitotweaks-backend.vercel.app");
+    std::wstring path = EWSTR("/api/owner-stats");
+    std::string resp = HttpPostJSON(host.c_str(), path.c_str(), body);
     if (resp.empty()) return -1;
     if (resp.find("\"valid\":true") == std::string::npos) {
         // Detectar rechazo por HWID distinto (daysLeft:-2)
@@ -291,7 +298,43 @@ bool  bHitmarker = false;
 bool  bKillfeed  = false;
 bool  bChams     = false;
 bool  bAntiAFK  = false;
-bool  bUserFilter = false; // solo mostrar ESP de usuarios específicos
+bool  bUserFilter = false;
+
+// ---- inyector de DLL ----
+static char  g_dllPath[MAX_PATH] = "";
+static std::string g_injectStatus;
+static DWORD g_injectStatusTime = 0;
+
+static bool InjectDLL(const char* dllPath) {
+    // Abrir handle propio con permisos de inyección (mem.proc solo tiene VM_READ)
+    HANDLE hProc = OpenProcess(
+        PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+        FALSE, mem.pid);
+    if (!hProc) {
+        g_injectStatus = "Error: no se pudo abrir proceso (" + std::to_string(GetLastError()) + ")";
+        g_injectStatusTime = GetTickCount();
+        return false;
+    }
+
+    SIZE_T len = strlen(dllPath) + 1;
+    LPVOID remote = VirtualAllocEx(hProc, nullptr, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remote) { CloseHandle(hProc); return false; }
+    if (!WriteProcessMemory(hProc, remote, dllPath, len, nullptr)) {
+        VirtualFreeEx(hProc, remote, 0, MEM_RELEASE); CloseHandle(hProc); return false;
+    }
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    FARPROC loadLib = GetProcAddress(k32, "LoadLibraryA");
+    HANDLE th = CreateRemoteThread(hProc, nullptr, 0,
+        (LPTHREAD_START_ROUTINE)loadLib, remote, 0, nullptr);
+    if (!th) {
+        VirtualFreeEx(hProc, remote, 0, MEM_RELEASE); CloseHandle(hProc); return false;
+    }
+    WaitForSingleObject(th, 5000);
+    CloseHandle(th);
+    VirtualFreeEx(hProc, remote, 0, MEM_RELEASE);
+    CloseHandle(hProc);
+    return true;
+} // solo mostrar ESP de usuarios específicos
 std::vector<std::string> g_targetUsers; // lista de usernames objetivo
 char  g_targetUserInput[64] = "";       // buffer para input de nuevo user
 
@@ -779,10 +822,10 @@ static void AimbotThread() {
         if (keyHeld) {
             if (dist < 0.3f) continue; // deadzone mínimo
 
-            float baseGain = std::clamp(fAimSmooth / 350.f, 0.02f, 0.25f);
-            // gain proporcional: más suave cuando está cerca para no oscilar
-            float t = std::clamp(dist / 120.f, 0.15f, 1.0f);
-            float gain = baseGain * t;
+            // mover una fraccion de la distancia por frame — gain pequeño evita overshoot
+            float baseGain = std::clamp(fAimSmooth / 600.f, 0.03f, 0.18f);
+            float nearDamp  = std::clamp(dist / 8.f, 0.40f, 1.0f); // frena suave en últimos 8px
+            float gain = baseGain * nearDamp;
 
             accumX += dx * gain; accumY += dy * gain;
             LONG mx = (LONG)accumX, my = (LONG)accumY;
@@ -2208,6 +2251,63 @@ int main() {
                 ImGui::EndTabItem();
             }
 
+            if (ImGui::BeginTabItem("  Scripts  ")) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.5f,0.7f,1.f,1.f), "Inyector de DLL");
+                ImGui::Separator(); ImGui::Spacing();
+
+                ImGui::Text("DLL:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-80.f);
+                ImGui::InputText("##dllpath", g_dllPath, sizeof(g_dllPath));
+                ImGui::SameLine();
+                if (ImGui::Button("...##browse", ImVec2(70,0))) {
+                    OPENFILENAMEA ofn{};
+                    char buf[MAX_PATH] = "";
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = nullptr;
+                    ofn.lpstrFilter = "DLL\0*.dll\0Todos\0*.*\0";
+                    ofn.lpstrFile = buf;
+                    ofn.nMaxFile = MAX_PATH;
+                    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                    if (GetOpenFileNameA(&ofn))
+                        strncpy_s(g_dllPath, buf, MAX_PATH - 1);
+                }
+
+                ImGui::Spacing();
+                bool canInject = g_dllPath[0] && mem.pid;
+                if (!canInject) ImGui::BeginDisabled();
+                if (ImGui::Button("Inyectar", ImVec2(-1, 0))) {
+                    if (mem.pid) {
+                        std::thread([]{
+                            if (InjectDLL(g_dllPath)) {
+                                g_injectStatus = "OK: DLL inyectada";
+                            } else {
+                                g_injectStatus = "Error: fallo la inyeccion";
+                            }
+                            g_injectStatusTime = GetTickCount();
+                        }).detach();
+                    }
+                }
+                if (!canInject) ImGui::EndDisabled();
+
+                if (!g_injectStatus.empty() && GetTickCount() - g_injectStatusTime < 4000) {
+                    ImGui::Spacing();
+                    bool ok = g_injectStatus.rfind("OK",0) == 0;
+                    ImGui::TextColored(ok ? ImVec4(0.2f,0.9f,0.3f,1.f) : ImVec4(0.9f,0.2f,0.2f,1.f),
+                        "%s", g_injectStatus.c_str());
+                } else if (!g_injectStatus.empty() && GetTickCount() - g_injectStatusTime >= 4000) {
+                    g_injectStatus.clear();
+                }
+
+                if (!mem.proc) {
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("(Roblox no detectado)");
+                }
+
+                ImGui::EndTabItem();
+            }
+
             ImGui::EndTabBar();
         }
         ImGui::EndChild();
@@ -2281,6 +2381,13 @@ int main() {
         static DWORD lastSave = 0;
         DWORD nowSave = GetTickCount();
         if (nowSave - lastSave > 5000) { SaveConfig(); lastSave = nowSave; }
+
+        // check periódico anti-debug (cada 7s) — detecta attach después del inicio
+        static DWORD lastSecCheck = 0;
+        if (nowSave - lastSecCheck > 7000) {
+            lastSecCheck = nowSave;
+            if (PeriodicSecurityCheck()) ExitProcess(0);
+        }
     }
 
     SaveConfig();
