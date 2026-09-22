@@ -61,29 +61,7 @@ static uint32_t GetHWID() {
 
 // ---- Anti-Debugging & Seguridad ----
 static bool PerformSecurityCheck() {
-    // 1. IsDebuggerPresent básico
-    if (IsDebuggerPresent()) return false;
-
-    // 2. Remote debugger
-    BOOL isRemoteDebugger = FALSE;
-    if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &isRemoteDebugger) && isRemoteDebugger)
-        return false;
-
-    // 3. NtQueryInformationProcess — debug port
-    if (CheckNtDebug()) return false;
-
-    // 4. Heap flags — Cheat Engine/OllyDbg dejan rastros
-    if (CheckHeapFlags()) return false;
-
-    // 5. Hardware breakpoints DR0-DR3
-    if (CheckHWBreakpoints()) return false;
-
-    // 6. VM detection
-    if (CheckCPUID_VM())    return false;
-    if (CheckVMRegistry())  return false;
-    if (CheckVMProcesses()) return false;
-
-    return true;
+    return SecurityCheck();
 }
 
 static std::string HWIDString() {
@@ -172,18 +150,24 @@ static std::string TodayStr() {
     return buf;
 }
 
-// Guardar key + HWID + fecha de canje + dias localmente
+// Guardar key cifrada con XOR+HWID
 static void SaveLicense(const std::string& key, uint32_t hwid, int days) {
-    std::ofstream f(LicensePath());
-    if (f) f << key << "\n" << hwid << "\n" << days << "\n" << TodayStr() << "\n";
+    std::string plain = key + "\n" + std::to_string(hwid) + "\n" + std::to_string(days) + "\n" + TodayStr() + "\n";
+    std::string enc = EncryptLicense(plain, hwid);
+    std::ofstream f(LicensePath(), std::ios::binary);
+    if (f) f.write(enc.data(), enc.size());
 }
 
-// Cargar y verificar: devuelve false si venció
+// Cargar y descifrar licencia
 static bool LoadLicense(std::string& keyOut) {
-    std::ifstream f(LicensePath());
+    std::ifstream f(LicensePath(), std::ios::binary);
     if (!f) return false;
+    std::string enc((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (enc.empty()) return false;
+    std::string plain = DecryptLicense(enc, GetHWID());
+    std::istringstream ss(plain);
     std::string k, redeemedAt; uint32_t hw = 0; int days = 0;
-    if (!(f >> k >> hw >> days >> redeemedAt)) return false;
+    if (!(ss >> k >> hw >> days >> redeemedAt)) return false;
     if (hw != GetHWID()) return false;
     // verificar vencimiento
     if (days > 0 && !redeemedAt.empty() && redeemedAt != "NONE") {
@@ -1144,6 +1128,13 @@ int main() {
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"CeitusRbxESP_Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(hMutex); return 0; }
 
+    // ocultar thread del debugger y borrar PE header
+    HideThreadFromDebugger();
+    ErasePEHeader();
+
+    // inicializar checksum del .text para detectar patches en runtime
+    InitChecksum();
+
     FreeConsole();
 
     // auto-login: si hay license local válida para este HWID y no venció, entrar directo
@@ -1195,6 +1186,14 @@ int main() {
         }
     }
     ShowWindow(menuWnd, SW_SHOW);
+
+    // anti-screenshot: ventana invisible en OBS/capturas (WDA_EXCLUDEFROMCAPTURE = 0x11)
+    typedef BOOL(WINAPI* pSWDA)(HWND, DWORD);
+    HMODULE hUser = GetModuleHandleW(L"user32.dll");
+    if (hUser) {
+        auto fnSWDA = (pSWDA)GetProcAddress(hUser, "SetWindowDisplayAffinity");
+        if (fnSWDA) fnSWDA(menuWnd, 0x11);
+    }
 
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 2; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
