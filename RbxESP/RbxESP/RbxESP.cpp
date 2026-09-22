@@ -297,6 +297,7 @@ bool  bKillfeed  = false;
 bool  bChams     = false;
 bool  bAntiAFK  = false;
 bool  bUserFilter = false;
+bool  bThirdPerson = false; // forzar tercera persona via WriteProcessMemory
 
 // ---- inyector de DLL ----
 static char  g_dllPath[MAX_PATH] = "";
@@ -1011,6 +1012,22 @@ static void ESPScanThread() {
         if (dm) g_placeId = mem.Read<int64_t>(dm + Offsets::DataModel::PlaceId);
         g_localPos = localPos;
 
+        // tercera persona: escribe CameraType=0 (Classic) en el objeto Camera
+        if (bThirdPerson && dm) {
+            uintptr_t ws = mem.Read<uintptr_t>(dm + Offsets::DataModel::Workspace);
+            if (!ws) ws = FindFirstChild(dm, "Workspace");
+            if (ws) {
+                uintptr_t cam = mem.Read<uintptr_t>(ws + Offsets::Workspace::CurrentCamera);
+                if (cam) {
+                    int32_t camType = mem.Read<int32_t>(cam + Offsets::Camera::CameraType);
+                    if (camType != 0) { // 0 = Classic (tercera persona)
+                        int32_t classic = 0;
+                        WriteProcessMemory(mem.proc, (LPVOID)(cam + Offsets::Camera::CameraType), &classic, sizeof(classic), nullptr);
+                    }
+                }
+            }
+        }
+
         // re-attach si DM falla >1s (teleport detection)
         static DWORD dmFailSince = 0;
         if (!dm) {
@@ -1106,6 +1123,7 @@ static void SaveConfig(int mode = -1) {
       << panicKey << "\n"
       << bAntiAFK << "\n"
       << bUserFilter << "\n"
+      << bThirdPerson << "\n"
       << (int)g_targetUsers.size() << "\n";
     for (auto& u : g_targetUsers) f << u << "\n";
 }
@@ -1140,6 +1158,7 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) f >> panicKey;
     if (!f.eof()) f >> bAntiAFK;
     if (!f.eof()) f >> bUserFilter;
+    if (!f.eof()) f >> bThirdPerson;
     { int cnt = 0; if (!f.eof()) f >> cnt;
       g_targetUsers.clear();
       for (int i = 0; i < cnt && !f.eof(); i++) {
@@ -2154,6 +2173,7 @@ int main() {
                     ImGui::Unindent(12.f);
                 }
                 ImGui::Checkbox("Bunny Hop [Space]", &bBhop);
+                ImGui::Checkbox("Tercera Persona", &bThirdPerson);
                 ImGui::Checkbox("Anti-AFK", &bAntiAFK);
                 ImGui::Spacing(); ImGui::Spacing();
                 ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "HUD");
