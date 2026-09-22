@@ -42,7 +42,6 @@
 #define URL_EXE          "https://github.com/" GITHUB_USER "/" GITHUB_REPO "/releases/latest/download/RbxESP.exe"
 
 // ---- salt interno para derivar keys (no cambiar después de distribuir) ----
-static const uint32_t KEY_SALT = 0xCE17A5B3u;
 
 // ---- HWID: número de serie del disco C:\ + nombre de máquina hasheado ----
 static uint32_t GetHWID() {
@@ -94,21 +93,7 @@ static std::string HWIDString() {
     return buf;
 }
 
-// ---- derivar key válida para un HWID (usar en tu generador externo) ----
-static std::string DeriveKey(uint32_t hwid) {
-    uint32_t k = hwid ^ KEY_SALT;
-    k *= 0x9e3779b9u;
-    k ^= (k >> 13);
-    k *= 0x85ebca6bu;
-    k ^= (k >> 16);
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%04X-%04X", (k >> 16) & 0xFFFF, k & 0xFFFF);
-    return buf;
-}
 
-static bool ValidateKey(const std::string& key) {
-    return key == DeriveKey(GetHWID());
-}
 
 // ---- HTTP GET simple (WinINet) ----
 static std::string HttpGet(const char* url, int timeoutMs = 5000) {
