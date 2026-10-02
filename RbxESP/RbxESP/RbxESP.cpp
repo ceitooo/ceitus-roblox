@@ -387,6 +387,7 @@ struct CachedPlayerESP {
     COLORREF    col;
     uintptr_t   character;
     uintptr_t   hrp;
+    uintptr_t   humanoid;
     DWORD       boneUpdateTime;
     Vector3     velocity;
     bool        hasChat;
@@ -442,6 +443,8 @@ static HWND  g_rbxWnd = nullptr; // ventana de Roblox (global para threads)
 ViewMatrix_t lastVm{};
 uintptr_t    lastPs = 0;
 uintptr_t    g_cachedAimTarget = 0; // target actual del aimbot (para FOV dinámico)
+uintptr_t    g_cachedAimChar   = 0; // character del target (para snap indicator en overlay)
+bool         bShowFov          = true; // mostrar círculo FOV independientemente del aimbot
 
 // radar: lista de entradas para dibujar (llenada en ESP loop, leída en render)
 struct RadarEntry { float dx, dz; COLORREF col; std::string name; float dist; };
@@ -665,7 +668,7 @@ static void AimbotThread() {
         } else { lastHumState = 0; }
 
         if (!bAimbot && !bTriggerbot) {
-            hasSmooth = false; cachedPlayer = 0; g_cachedAimTarget = 0; continue;
+            hasSmooth = false; cachedPlayer = 0; g_cachedAimTarget = 0; g_cachedAimChar = 0; continue;
         }
 
         float sw = (float)g_width, sh = (float)g_height;
@@ -690,7 +693,7 @@ static void AimbotThread() {
                 if (cachedPlayer) { lastDeadPlayer = cachedPlayer; lastDeadTime = GetTickCount(); }
                 cachedPlayer = 0; cachedHeadPart = 0; cachedHRP = 0; cachedChar = 0;
                 cachedUpperTorso = 0;
-                g_cachedAimTarget = 0; lastHeadTime = 0; headVel = {}; lockedHRPY = 0.f;
+                g_cachedAimTarget = 0; g_cachedAimChar = 0; lastHeadTime = 0; headVel = {}; lockedHRPY = 0.f;
             }
         }
 
@@ -706,7 +709,7 @@ static void AimbotThread() {
                 if (hw.y < -1000.f) {
                     if (cachedPlayer) { lastDeadPlayer = cachedPlayer; lastDeadTime = GetTickCount(); }
                     cachedPlayer = 0; cachedHeadPart = 0; cachedHRP = 0; cachedChar = 0;
-                    g_cachedAimTarget = 0; lastHeadTime = 0; headVel = {}; lockedHRPY = 0.f;
+                    g_cachedAimTarget = 0; g_cachedAimChar = 0; lastHeadTime = 0; headVel = {}; lockedHRPY = 0.f;
                 } else {
                     // chequeo de distancia 3D — si está más lejos que el límite, soltar
                     float llen2 = g_localPos.x*g_localPos.x + g_localPos.y*g_localPos.y + g_localPos.z*g_localPos.z;
@@ -791,6 +794,7 @@ static void AimbotThread() {
             if (newPlayer) {
                 cachedPlayer = newPlayer; cachedHeadPart = newHP; cachedHRP = newHRP;
                 cachedChar = mem.Read<uintptr_t>(newPlayer + Offsets::Player::ModelInstance);
+                g_cachedAimChar = cachedChar;
                 cachedUpperTorso = cachedChar ? FindFirstChild(cachedChar, "UpperTorso") : 0;
                 if (!cachedUpperTorso && cachedChar) cachedUpperTorso = FindFirstChild(cachedChar, "Torso");
                 lastHeadTime = 0; headVel = {};
@@ -800,7 +804,7 @@ static void AimbotThread() {
             }
         }
 
-        if (!targetValid && !cachedPlayer) { g_cachedAimTarget = 0; continue; }
+        if (!targetValid && !cachedPlayer) { g_cachedAimTarget = 0; g_cachedAimChar = 0; continue; }
         g_cachedAimTarget = cachedPlayer;
         if (!cachedPlayer || !targetValid) continue; // no mover mouse si está fuera del FOV
 
@@ -965,19 +969,25 @@ static void FlyNoclipThread() {
         {
             static bool  s_prevFly  = false;
             static DWORD s_flyStart = 0;
-            if (!s_prevFly && bFly) s_flyStart = GetTickCount();
+            static float s_curVelY  = 0.f;
+            if (!s_prevFly && bFly) { s_flyStart = GetTickCount(); s_curVelY = 0.f; }
             s_prevFly = bFly;
 
             if (bFly) {
                 Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
-                bool space = (GetAsyncKeyState(VK_SPACE)  & 0x8000) != 0;
-                bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0;
-                bool liftOff = (GetTickCount() - s_flyStart < 400); // 400ms despegue al activar
+                bool space   = (GetAsyncKeyState(VK_SPACE)  & 0x8000) != 0;
+                bool shift   = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0;
+                bool liftOff = (GetTickCount() - s_flyStart < 500);
 
-                if (space)        vel.y = fFlySpeed;
-                else if (shift)   vel.y = -fFlySpeed;
-                else if (liftOff) vel.y = fFlySpeed * 0.5f; // impulso inicial para despegar del suelo
-                else              vel.y = 0.f;               // hover
+                float targetY;
+                if (space)        targetY = fFlySpeed;
+                else if (shift)   targetY = -fFlySpeed;
+                else if (liftOff) targetY = fFlySpeed * 0.6f;
+                else              targetY = 0.f;
+
+                // lerp suave: 30% del camino cada 4ms → natural sin saltos
+                s_curVelY += (targetY - s_curVelY) * 0.30f;
+                vel.y = s_curVelY;
                 mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
             }
         }
@@ -1126,6 +1136,7 @@ static void ESPScanThread() {
             ce.name      = pi.name;
             ce.character = pi.character;
             ce.hrp       = pi.hrp;
+            ce.humanoid  = pi.humanoid;
 
             // velocidad del HRP
             if (bVelocityESP && pi.hrp) {
@@ -1397,7 +1408,8 @@ static void SaveConfig(int mode = -1) {
       << bSilentAim   << "\n" << bSpectatorList << "\n"
       << bChatESP    << "\n"
       << bNoclip     << "\n"
-      << bFly        << "\n" << fFlySpeed << "\n";
+      << bFly        << "\n" << fFlySpeed << "\n"
+      << bShowFov    << "\n";
 }
 
 static void LoadConfig(int mode = -1) {
@@ -1457,6 +1469,7 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) f >> bFly;
     if (!f.eof()) f >> fFlySpeed;
     if (fFlySpeed < 5.f || fFlySpeed > 200.f) fFlySpeed = 50.f;
+    if (!f.eof()) f >> bShowFov;
     // clamp para evitar valores absurdos de configs viejas
     if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
     if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
@@ -1679,6 +1692,13 @@ int main() {
             }
 
             for (auto& ce : snap) {
+                // salud fresca desde Humanoid cacheado — sin delay de scan
+                if (bHealthBar && ce.humanoid > 0x10000000000ULL) {
+                    float fh = mem.Read<float>(ce.humanoid + Offsets::Humanoid::Health);
+                    if (fh > 0.f && fh <= 10000.f) ce.health = fh;
+                    float fm = mem.Read<float>(ce.humanoid + Offsets::Humanoid::MaxHealth);
+                    if (fm > 0.f && fm <= 10000.f) ce.maxHealth = fm;
+                }
                 // posición fresca desde HRP cacheado — 2 RPM rápidos, sin FindFirstChild
                 Vector3 pos = ce.pos;
                 if (ce.hrp) {
@@ -1899,10 +1919,31 @@ int main() {
                 }
             }
 
-            // círculo de FOV dinámico: verde si hay target, blanco si no
-            if (bAimbot) {
-                COLORREF fovCol = g_cachedAimTarget ? RGB(0,220,80) : RGB(200,200,200);
-                DrawEllipse({sw * 0.5f, sh * 0.5f}, fAimFov, fAimFov, fovCol);
+            // círculo de FOV: sigue el cursor (= centro pantalla en Roblox, cursor libre en otros juegos)
+            if ((bAimbot && !bAimbotNoFov) || bShowFov) {
+                POINT cur; GetCursorPos(&cur);
+                float fcx = (float)cur.x, fcy = (float)cur.y;
+                // fallback a centro si cursor parece fuera de pantalla
+                if (fcx < 0 || fcx > sw || fcy < 0 || fcy > sh) { fcx = sw*0.5f; fcy = sh*0.5f; }
+
+                bool locked = (g_cachedAimTarget != 0);
+                COLORREF fovCol = locked ? RGB(0,220,80) : (bAimbot ? RGB(200,200,200) : RGB(120,120,120));
+                DrawEllipse({fcx, fcy}, fAimFov, fAimFov, fovCol);
+
+                // snap indicator: pequeño reticle en la cabeza del target cuando hay lock
+                if (locked && g_cachedAimChar) {
+                    uintptr_t ac = g_cachedAimChar;
+                    for (auto& ce : snap) {
+                        if (ce.character != ac) continue;
+                        Vector2 hss;
+                        if (WorldToScreen(vm, ce.headPos, hss, sw, sh)) {
+                            DrawEllipse({hss.x, hss.y}, 12.f, 12.f, RGB(0,255,80));
+                            // línea del centro al target
+                            DrawLine({fcx, fcy}, {hss.x, hss.y}, RGB(0,200,60), 1);
+                        }
+                        break;
+                    }
+                }
             }
 
             // ---- radar mejorado ----
@@ -2596,6 +2637,9 @@ int main() {
                     ImGui::Checkbox("Ignorar equipo", &bAimbotTeamFilter);
                     ImGui::SameLine(200);
                     ImGui::Checkbox("Sin FOV", &bAimbotNoFov);
+                    ImGui::Checkbox("Mostrar FOV", &bShowFov);
+                    ImGui::SameLine(200);
+                    if (bShowFov) ImGui::TextColored(ImVec4(0.5f,0.8f,1.f,0.7f), "Sigue cursor • verde=lock");
                     static bool waitingForKey = false;
                     static DWORD waitStartTime = 0;
                     if (waitingForKey) {
