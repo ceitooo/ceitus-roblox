@@ -301,7 +301,7 @@ bool  bThirdPerson = false;
 // nuevas características
 bool  bNoclip          = false;
 bool  bFly             = false;
-float fFlySpeed        = 20.f;
+float fFlySpeed        = 50.f;
 bool  bWalkSpeed       = false;
 float fWalkSpeed       = 16.f;
 bool  bJumpPower       = false;
@@ -966,7 +966,7 @@ static void FlyNoclipThread() {
             Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
             if (GetAsyncKeyState(VK_SPACE) & 0x8000)       vel.y = fFlySpeed;
             else if (GetAsyncKeyState(VK_LSHIFT) & 0x8000) vel.y = -fFlySpeed;
-            else                                             vel.y = 0.f;
+            else if (vel.y < 15.f)                          vel.y = 0.f; // hover pero sin cancelar saltos
             mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
         }
 
@@ -1444,7 +1444,7 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) f >> bNoclip;
     if (!f.eof()) f >> bFly;
     if (!f.eof()) f >> fFlySpeed;
-    if (fFlySpeed < 5.f || fFlySpeed > 100.f) fFlySpeed = 20.f;
+    if (fFlySpeed < 5.f || fFlySpeed > 200.f) fFlySpeed = 50.f;
     // clamp para evitar valores absurdos de configs viejas
     if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
     if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
@@ -2635,7 +2635,7 @@ int main() {
                 if (bFly) {
                     ImGui::Indent(12.f);
                     ImGui::SetNextItemWidth(200.f);
-                    ImGui::SliderFloat("Velocidad vuelo##fly", &fFlySpeed, 5.f, 100.f, "%.0f");
+                    ImGui::SliderFloat("Velocidad vuelo##fly", &fFlySpeed, 5.f, 200.f, "%.0f");
                     ImGui::TextColored(ImVec4(0.5f,0.8f,1.f,0.8f), "Space=subir  Shift=bajar");
                     ImGui::Unindent(12.f);
                 }
