@@ -433,6 +433,8 @@ static COLORREF GetESPColor(COLORREF defaultCol, int mode) {
 bool  bAntiFlash = false;
 bool  bAntiSmoke = false;
 int   aimbotKey  = 'X';
+int   flyUpKey   = 'F'; // tecla para subir volando
+int   flyDownKey = 'C'; // tecla para bajar volando
 int   menuKey    = VK_INSERT;
 int   gameMode   = 0;
 bool  bTeamFilter = false;
@@ -975,8 +977,9 @@ static void FlyNoclipThread() {
 
             if (bFly) {
                 Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
-                bool space   = (GetAsyncKeyState(VK_SPACE)  & 0x8000) != 0;
-                bool shift   = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0;
+                Vector3 pos = mem.Read<Vector3>(prim + Offsets::Primitive::Position);
+                bool space   = flyUpKey   && (GetAsyncKeyState(flyUpKey)   & 0x8000) != 0;
+                bool shift   = flyDownKey && (GetAsyncKeyState(flyDownKey) & 0x8000) != 0;
                 bool liftOff = (GetTickCount() - s_flyStart < 500);
 
                 float targetY;
@@ -987,8 +990,15 @@ static void FlyNoclipThread() {
 
                 // lerp suave: 30% del camino cada 4ms → natural sin saltos
                 s_curVelY += (targetY - s_curVelY) * 0.30f;
+
+                // 1) velocidad (juegos con physics ownership del cliente)
                 vel.y = s_curVelY;
                 mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
+
+                // 2) posición directa (juegos con BodyVelocity u override del server)
+                //    cuando s_curVelY=0 (hover) ancla la Y contra gravity/constraints
+                pos.y += s_curVelY * 0.004f;
+                mem.Write(prim + Offsets::Primitive::Position, pos);
             }
         }
 
@@ -1409,7 +1419,9 @@ static void SaveConfig(int mode = -1) {
       << bChatESP    << "\n"
       << bNoclip     << "\n"
       << bFly        << "\n" << fFlySpeed << "\n"
-      << bShowFov    << "\n";
+      << bShowFov    << "\n"
+      << flyUpKey    << "\n"
+      << flyDownKey  << "\n";
 }
 
 static void LoadConfig(int mode = -1) {
@@ -1470,6 +1482,8 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) f >> fFlySpeed;
     if (fFlySpeed < 5.f || fFlySpeed > 200.f) fFlySpeed = 50.f;
     if (!f.eof()) f >> bShowFov;
+    if (!f.eof()) { int k; f >> k; if (k >= 0x08 && k < 0xFE) flyUpKey = k; }
+    if (!f.eof()) { int k; f >> k; if (k >= 0x08 && k < 0xFE) flyDownKey = k; }
     // clamp para evitar valores absurdos de configs viejas
     if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
     if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
@@ -1919,33 +1933,6 @@ int main() {
                 }
             }
 
-            // círculo de FOV: sigue el cursor (= centro pantalla en Roblox, cursor libre en otros juegos)
-            if ((bAimbot && !bAimbotNoFov) || bShowFov) {
-                POINT cur; GetCursorPos(&cur);
-                float fcx = (float)cur.x, fcy = (float)cur.y;
-                // fallback a centro si cursor parece fuera de pantalla
-                if (fcx < 0 || fcx > sw || fcy < 0 || fcy > sh) { fcx = sw*0.5f; fcy = sh*0.5f; }
-
-                bool locked = (g_cachedAimTarget != 0);
-                COLORREF fovCol = locked ? RGB(0,220,80) : (bAimbot ? RGB(200,200,200) : RGB(120,120,120));
-                DrawEllipse({fcx, fcy}, fAimFov, fAimFov, fovCol);
-
-                // snap indicator: pequeño reticle en la cabeza del target cuando hay lock
-                if (locked && g_cachedAimChar) {
-                    uintptr_t ac = g_cachedAimChar;
-                    for (auto& ce : snap) {
-                        if (ce.character != ac) continue;
-                        Vector2 hss;
-                        if (WorldToScreen(vm, ce.headPos, hss, sw, sh)) {
-                            DrawEllipse({hss.x, hss.y}, 12.f, 12.f, RGB(0,255,80));
-                            // línea del centro al target
-                            DrawLine({fcx, fcy}, {hss.x, hss.y}, RGB(0,200,60), 1);
-                        }
-                        break;
-                    }
-                }
-            }
-
             // ---- radar mejorado ----
             if (bRadar) {
                 float rr  = 110.f;
@@ -2008,6 +1995,32 @@ int main() {
 
                 // texto "RADAR" arriba
                 DrawText2D({rcx, rcy - rr - 12.f}, "RADAR", RGB(80,100,160));
+            }
+        }
+
+        // círculo de FOV: independiente de ESP y bESP
+        if ((bAimbot && !bAimbotNoFov) || bShowFov) {
+            float fswF = (float)g_width, fshF = (float)g_height;
+            ViewMatrix_t vmF = lastVm;
+            POINT cur; GetCursorPos(&cur);
+            float fcx = (float)cur.x, fcy = (float)cur.y;
+            if (fcx < 0 || fcx > fswF || fcy < 0 || fcy > fshF) { fcx = fswF*0.5f; fcy = fshF*0.5f; }
+            bool locked = (g_cachedAimTarget != 0);
+            COLORREF fovCol = locked ? RGB(0,220,80) : (bAimbot ? RGB(200,200,200) : RGB(120,120,120));
+            DrawEllipse({fcx, fcy}, fAimFov, fAimFov, fovCol);
+            if (locked && g_cachedAimChar) {
+                uintptr_t ac = g_cachedAimChar;
+                std::vector<CachedPlayerESP> fovSnap;
+                { std::lock_guard<std::mutex> lk(g_espMtx); fovSnap = g_espCache; }
+                for (auto& ce : fovSnap) {
+                    if (ce.character != ac) continue;
+                    Vector2 hss;
+                    if (WorldToScreen(vmF, ce.headPos, hss, fswF, fshF)) {
+                        DrawEllipse({hss.x, hss.y}, 12.f, 12.f, RGB(0,255,80));
+                        DrawLine({fcx, fcy}, {hss.x, hss.y}, RGB(0,200,60), 1);
+                    }
+                    break;
+                }
             }
         }
 
@@ -2637,9 +2650,6 @@ int main() {
                     ImGui::Checkbox("Ignorar equipo", &bAimbotTeamFilter);
                     ImGui::SameLine(200);
                     ImGui::Checkbox("Sin FOV", &bAimbotNoFov);
-                    ImGui::Checkbox("Mostrar FOV", &bShowFov);
-                    ImGui::SameLine(200);
-                    if (bShowFov) ImGui::TextColored(ImVec4(0.5f,0.8f,1.f,0.7f), "Sigue cursor • verde=lock");
                     static bool waitingForKey = false;
                     static DWORD waitStartTime = 0;
                     if (waitingForKey) {
@@ -2663,6 +2673,9 @@ int main() {
                     }
                     ImGui::Unindent(12.f);
                 }
+                ImGui::Checkbox("Mostrar FOV", &bShowFov);
+                ImGui::SameLine(200);
+                if (bShowFov) ImGui::TextColored(ImVec4(0.5f,0.8f,1.f,0.7f), "Sigue cursor • verde=lock");
                 ImGui::Spacing();
                 SecHeader(dl, "TRIGGERBOT", IM_COL32(220,140,40,220));
                 ImGui::Checkbox("Triggerbot (auto-disparo)", &bTriggerbot);
@@ -2692,7 +2705,37 @@ int main() {
                     ImGui::Indent(12.f);
                     ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Velocidad vuelo##fly", &fFlySpeed, 5.f, 200.f, "%.0f");
-                    ImGui::TextColored(ImVec4(0.5f,0.8f,1.f,0.8f), "Space=subir  Shift=bajar");
+                    char upNm[16]="?", downNm[16]="?";
+                    if (flyUpKey>='A'&&flyUpKey<='Z') snprintf(upNm,sizeof(upNm),"%c",(char)flyUpKey);
+                    else if (flyUpKey==VK_SPACE) snprintf(upNm,sizeof(upNm),"Space");
+                    else snprintf(upNm,sizeof(upNm),"VK%d",flyUpKey);
+                    if (flyDownKey>='A'&&flyDownKey<='Z') snprintf(downNm,sizeof(downNm),"%c",(char)flyDownKey);
+                    else if (flyDownKey==VK_SHIFT||flyDownKey==VK_LSHIFT) snprintf(downNm,sizeof(downNm),"Shift");
+                    else snprintf(downNm,sizeof(downNm),"VK%d",flyDownKey);
+                    ImGui::TextColored(ImVec4(0.5f,0.8f,1.f,0.8f),"%s=subir  %s=bajar",upNm,downNm);
+                    static bool waitFlyUp=false, waitFlyDown=false;
+                    static DWORD wFlyUpT=0, wFlyDownT=0;
+                    if (waitFlyUp) {
+                        ImGui::TextColored(ImVec4(0.45f,0.70f,1.f,1.f),"Subir: presiona tecla... (ESC cancela)");
+                        if (GetTickCount()-wFlyUpT>300){for(int vk=0x08;vk<0xFE;vk++){
+                            if(vk==VK_LBUTTON||vk==VK_RBUTTON)continue;
+                            if(vk==VK_ESCAPE){if(GetAsyncKeyState(vk)&0x8000){waitFlyUp=false;break;}continue;}
+                            if(GetAsyncKeyState(vk)&0x8000){flyUpKey=vk;waitFlyUp=false;break;}}}
+                    } else {
+                        char btnUp[48]; snprintf(btnUp,sizeof(btnUp),"Tecla subir: %s##fu",upNm);
+                        if(ImGui::Button(btnUp,ImVec2(130,0))){waitFlyUp=true;wFlyUpT=GetTickCount();}
+                    }
+                    ImGui::SameLine(145.f);
+                    if (waitFlyDown) {
+                        ImGui::TextColored(ImVec4(0.45f,0.70f,1.f,1.f),"Bajar: presiona tecla...");
+                        if (GetTickCount()-wFlyDownT>300){for(int vk=0x08;vk<0xFE;vk++){
+                            if(vk==VK_LBUTTON||vk==VK_RBUTTON)continue;
+                            if(vk==VK_ESCAPE){if(GetAsyncKeyState(vk)&0x8000){waitFlyDown=false;break;}continue;}
+                            if(GetAsyncKeyState(vk)&0x8000){flyDownKey=vk;waitFlyDown=false;break;}}}
+                    } else {
+                        char btnDown[48]; snprintf(btnDown,sizeof(btnDown),"Tecla bajar: %s##fd",downNm);
+                        if(ImGui::Button(btnDown,ImVec2(130,0))){waitFlyDown=true;wFlyDownT=GetTickCount();}
+                    }
                     ImGui::Unindent(12.f);
                 }
                 ImGui::Spacing();
