@@ -962,12 +962,24 @@ static void FlyNoclipThread() {
         uintptr_t prim = mem.Read<uintptr_t>(lhrp + Offsets::BasePart::Primitive);
         if (!prim || prim < 0x10000000000ULL) continue;
 
-        if (bFly) {
-            Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
-            if (GetAsyncKeyState(VK_SPACE) & 0x8000)       vel.y = fFlySpeed;
-            else if (GetAsyncKeyState(VK_LSHIFT) & 0x8000) vel.y = -fFlySpeed;
-            else if (vel.y < 15.f)                          vel.y = 0.f; // hover pero sin cancelar saltos
-            mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
+        {
+            static bool  s_prevFly  = false;
+            static DWORD s_flyStart = 0;
+            if (!s_prevFly && bFly) s_flyStart = GetTickCount();
+            s_prevFly = bFly;
+
+            if (bFly) {
+                Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
+                bool space = (GetAsyncKeyState(VK_SPACE)  & 0x8000) != 0;
+                bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0;
+                bool liftOff = (GetTickCount() - s_flyStart < 400); // 400ms despegue al activar
+
+                if (space)        vel.y = fFlySpeed;
+                else if (shift)   vel.y = -fFlySpeed;
+                else if (liftOff) vel.y = fFlySpeed * 0.5f; // impulso inicial para despegar del suelo
+                else              vel.y = 0.f;               // hover
+                mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
+            }
         }
 
         if (bNoclip) {
