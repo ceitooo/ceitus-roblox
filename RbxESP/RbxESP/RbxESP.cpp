@@ -2630,7 +2630,16 @@ int main() {
                 ImGui::TableNextColumn(); ImGui::Checkbox("Bunny Hop [Space]", &bBhop);
                 ImGui::TableNextColumn(); ImGui::Checkbox("Anti-AFK",          &bAntiAFK);
                 ImGui::TableNextColumn(); ImGui::Checkbox("Tercera Persona",   &bThirdPerson);
+                ImGui::TableNextColumn(); ImGui::Checkbox("Noclip",            &bNoclip);
+                ImGui::TableNextColumn(); ImGui::Checkbox("Fly",               &bFly);
                 ImGui::EndTable();
+                if (bFly) {
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderFloat("Velocidad vuelo##fly", &fFlySpeed, 5.f, 100.f, "%.0f");
+                    ImGui::TextColored(ImVec4(0.5f,0.8f,1.f,0.8f), "Space=subir  Shift=bajar");
+                    ImGui::Unindent(12.f);
+                }
                 ImGui::Spacing();
                 SecHeader(dl, "JUGADOR", IM_COL32(80,220,180,220));
                 ImGui::TextColored(ImVec4(1.f,0.75f,0.2f,0.9f), "Escribe en memoria del juego — bajo tu propio riesgo");
@@ -2654,14 +2663,6 @@ int main() {
                     ImGui::Indent(12.f);
                     ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Gravedad##grav", &fGravity, 0.f, 500.f, "%.0f");
-                    ImGui::Unindent(12.f);
-                }
-                ImGui::Checkbox("Noclip", &bNoclip);
-                ImGui::Checkbox("Fly [Space=subir / Shift=bajar]", &bFly);
-                if (bFly) {
-                    ImGui::Indent(12.f);
-                    ImGui::SetNextItemWidth(200.f);
-                    ImGui::SliderFloat("Velocidad vuelo##fly", &fFlySpeed, 5.f, 100.f, "%.0f");
                     ImGui::Unindent(12.f);
                 }
                 ImGui::Spacing();
