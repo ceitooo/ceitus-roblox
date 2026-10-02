@@ -9,18 +9,20 @@
 struct Memory {
     HANDLE    proc = nullptr;
     uintptr_t base = 0;
+    DWORD     pid  = 0;
 
     bool Attach(const wchar_t* name) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         PROCESSENTRY32W pe{ sizeof(pe) };
-        while (Process32NextW(snap, &pe)) {
+        if (Process32FirstW(snap, &pe)) do {
             if (!wcscmp(pe.szExeFile, name)) {
                 CloseHandle(snap);
-                proc = OpenProcess(PROCESS_VM_READ, FALSE, pe.th32ProcessID);
-                base = ModBase(pe.th32ProcessID, name);
+                pid  = pe.th32ProcessID;
+                proc = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+                base = ModBase(pid, name);
                 return proc != nullptr;
             }
-        }
+        } while (Process32NextW(snap, &pe));
         CloseHandle(snap);
         return false;
     }
@@ -30,6 +32,27 @@ struct Memory {
         T v{};
         ReadProcessMemory(proc, (LPCVOID)addr, &v, sizeof(T), nullptr);
         return v;
+    }
+
+    template<typename T>
+    bool Write(uintptr_t addr, const T& val) const {
+        if (!pid) return false;
+        HANDLE hw = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, pid);
+        if (!hw) return false;
+        SIZE_T written = 0;
+        bool ok = WriteProcessMemory(hw, (LPVOID)addr, &val, sizeof(T), &written);
+        CloseHandle(hw);
+        return ok && written == sizeof(T);
+    }
+
+    bool WriteRaw(uintptr_t addr, const void* data, size_t sz) const {
+        if (!pid) return false;
+        HANDLE hw = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, pid);
+        if (!hw) return false;
+        SIZE_T written = 0;
+        bool ok = WriteProcessMemory(hw, (LPVOID)addr, data, sz, &written);
+        CloseHandle(hw);
+        return ok;
     }
 
     std::string ReadRbxString(uintptr_t addr) const {
@@ -44,14 +67,14 @@ struct Memory {
 
 private:
     uintptr_t ModBase(DWORD pid, const wchar_t* mod) {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
         MODULEENTRY32W me{ sizeof(me) };
-        while (Module32NextW(snap, &me)) {
+        if (Module32FirstW(snap, &me)) do {
             if (!wcscmp(me.szModule, mod)) {
                 CloseHandle(snap);
                 return (uintptr_t)me.modBaseAddr;
             }
-        }
+        } while (Module32NextW(snap, &me));
         CloseHandle(snap);
         return 0;
     }

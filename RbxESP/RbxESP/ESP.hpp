@@ -38,6 +38,17 @@ inline uintptr_t FindFirstChild(uintptr_t inst, const char* name) {
     return 0;
 }
 
+// ---- buscar descendiente por nombre (recursivo, max depth 4) ----
+inline uintptr_t FindFirstDescendant(uintptr_t inst, const char* name, int depth = 0) {
+    if (depth > 4 || !inst) return 0;
+    for (uintptr_t child : GetChildren(inst)) {
+        if (GetInstanceName(child) == name) return child;
+        uintptr_t found = FindFirstDescendant(child, name, depth + 1);
+        if (found) return found;
+    }
+    return 0;
+}
+
 // ---- DataModel (cadena directa con FakeDataModel::Pointer) ----
 inline uintptr_t GetDataModel() {
     uintptr_t fdm = mem.Read<uintptr_t>(mem.base + Offsets::FakeDataModel::Pointer);
@@ -45,15 +56,68 @@ inline uintptr_t GetDataModel() {
     return mem.Read<uintptr_t>(fdm + Offsets::FakeDataModel::RealDataModel);
 }
 
-// ---- ViewMatrix del VisualEngine ----
+// ---- ViewProjection matrix ----
+// g_cachedDm, g_width, g_height son globales definidas en RbxESP.cpp / Overlay.hpp
+extern uintptr_t g_cachedDm;
+extern int g_width, g_height;
+
+// Valida que una ViewMatrix tenga valores razonables (no todo ceros/NaN)
+static inline bool IsValidVM(const ViewMatrix_t& vm) {
+    float s = 0.f;
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) s += fabsf(vm.m[i][j]);
+    return s > 0.1f && s < 1e10f;
+}
+
 inline ViewMatrix_t GetViewMatrix() {
-    ViewMatrix_t vm{};
-    uintptr_t ve = mem.Read<uintptr_t>(mem.base + Offsets::VisualEngine::Pointer);
-    if (!ve) return vm;
-    mem.Read<ViewMatrix_t>(ve + Offsets::VisualEngine::ViewMatrix);
-    ReadProcessMemory(mem.proc, (LPCVOID)(ve + Offsets::VisualEngine::ViewMatrix),
-        &vm, sizeof(vm), nullptr);
-    return vm;
+    ViewMatrix_t vp{};
+
+    // ── Método 1: leer ViewMatrix directo del VisualEngine (no depende de offsets de cámara) ──
+    if (Offsets::VisualEngine::Pointer && Offsets::VisualEngine::ViewMatrix) {
+        uintptr_t ve = mem.Read<uintptr_t>(mem.base + Offsets::VisualEngine::Pointer);
+        if (ve) {
+            ViewMatrix_t vm = mem.Read<ViewMatrix_t>(ve + Offsets::VisualEngine::ViewMatrix);
+            if (IsValidVM(vm)) return vm;
+        }
+    }
+
+    // ── Método 2: calcular desde Camera Rotation + Position + FOV (fallback) ──
+    uintptr_t dm = g_cachedDm;
+    if (!dm) return vp;
+    uintptr_t ws = mem.Read<uintptr_t>(dm + Offsets::DataModel::Workspace);
+    if (!ws) return vp;
+    uintptr_t cam = mem.Read<uintptr_t>(ws + Offsets::Workspace::CurrentCamera);
+    if (!cam) return vp;
+
+    // Roblox Camera layout: Rotation matrix (9 floats) at CFrame offset, Position (3 floats) at Position offset
+    float R[9]{}, P[3]{};
+    ReadProcessMemory(mem.proc, (LPCVOID)(cam + Offsets::Camera::CFrame), R, 36, nullptr);
+    ReadProcessMemory(mem.proc, (LPCVOID)(cam + Offsets::Camera::Position), P, 12, nullptr);
+
+    float fov = mem.Read<float>(cam + Offsets::Camera::FieldOfView);
+    float fovRad = (fov > 3.2f) ? (fov * 3.14159265f / 180.f) : fov;
+    if (fovRad < 0.01f || fovRad > 3.14f) fovRad = 1.2217f;
+    float aspect = (g_width > 0 && g_height > 0) ? (float)g_width / (float)g_height : 16.f/9.f;
+    float f = 1.f / tanf(fovRad * 0.5f);
+    float nearP = 0.1f, farP = 10000.f;
+
+    // R row-major: R[0..2]=right, R[3..5]=up, R[6..8]=back(-look)
+    // View = R^T, translation = -R^T * P
+    float vr0=R[0], vr1=R[3], vr2=R[6];
+    float vu0=R[1], vu1=R[4], vu2=R[7];
+    float vf0=R[2], vf1=R[5], vf2=R[8];
+    float tx = -(vr0*P[0] + vr1*P[1] + vr2*P[2]);
+    float ty = -(vu0*P[0] + vu1*P[1] + vu2*P[2]);
+    float tz = -(vf0*P[0] + vf1*P[1] + vf2*P[2]);
+
+    float A = -(farP + nearP) / (farP - nearP);
+    float B = -2.f * farP * nearP / (farP - nearP);
+
+    vp.m[0][0] = (f/aspect)*vr0; vp.m[0][1] = (f/aspect)*vr1; vp.m[0][2] = (f/aspect)*vr2; vp.m[0][3] = (f/aspect)*tx;
+    vp.m[1][0] = f*vu0;          vp.m[1][1] = f*vu1;          vp.m[1][2] = f*vu2;          vp.m[1][3] = f*ty;
+    vp.m[2][0] = A*vf0;          vp.m[2][1] = A*vf1;          vp.m[2][2] = A*vf2;          vp.m[2][3] = A*tz + B;
+    vp.m[3][0] = -vf0;           vp.m[3][1] = -vf1;           vp.m[3][2] = -vf2;           vp.m[3][3] = -tz;
+
+    return vp;
 }
 
 // ---- posición 3D de un BasePart ----

@@ -120,6 +120,13 @@ static void ApplyJson(const std::string& json)
         { "Instance_ChildrenStart",       &Offsets::Instance::ChildrenStart      },
         { "Instance_NameContainer",       &Offsets::Instance::NameContainer      },
         { "Instance_Parent",              &Offsets::Instance::Parent             },
+        // Camera
+        { "Camera_CFrame",                &Offsets::Camera::CFrame               },
+        { "Camera_Position",              &Offsets::Camera::Position             },
+        { "Camera_FieldOfView",           &Offsets::Camera::FieldOfView          },
+        { "Camera_ViewportSize",          &Offsets::Camera::ViewportSize         },
+        // Workspace
+        { "Workspace_CurrentCamera",      &Offsets::Workspace::CurrentCamera     },
         // Misc
         { "Misc_StringLength",            &Offsets::Misc::StringLength           },
         // Model

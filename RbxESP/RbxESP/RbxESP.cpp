@@ -297,7 +297,28 @@ bool  bKillfeed  = false;
 bool  bChams     = false;
 bool  bAntiAFK  = false;
 bool  bUserFilter = false;
-bool  bThirdPerson = false; // forzar tercera persona via WriteProcessMemory
+bool  bThirdPerson = false;
+// nuevas características
+bool  bNoclip          = false;
+bool  bWalkSpeed       = false;
+float fWalkSpeed       = 16.f;
+bool  bJumpPower       = false;
+float fJumpPower       = 50.f;
+bool  bGravity         = false;
+float fGravity         = 196.2f;
+bool  bVelocityESP     = false;
+bool  bCornerBoxes     = false;
+bool  bEspRangeEnabled = false;
+float fEspMaxDist      = 500.f;
+bool  bNoRecoil        = false;
+float fNoRecoilStr     = 1.0f;
+bool  bSilentAim       = false;
+bool  bSpectatorList   = false;
+static std::vector<std::string> g_spectatorList;
+bool  bChatESP         = false;
+struct ChatEntry { std::string name, msg; DWORD time; };
+static std::vector<ChatEntry> g_chatLog;
+static std::mutex g_chatMtx;
 
 // ---- inyector de DLL ----
 static char  g_dllPath[MAX_PATH] = "";
@@ -365,12 +386,15 @@ struct CachedPlayerESP {
     uintptr_t   character;
     uintptr_t   hrp;
     DWORD       boneUpdateTime;
+    Vector3     velocity;
+    bool        hasChat;
+    std::string chatMsg;
 };
 static std::vector<CachedPlayerESP> g_espCache;
 static std::mutex                   g_espMtx;
 static Vector3                      g_cachedLocalPosESP{};
 static uintptr_t                    g_cachedLp = 0;
-static uintptr_t                    g_cachedDm = 0;
+uintptr_t                    g_cachedDm = 0;
 
 static COLORREF HSVtoRGB(float h, float s, float v) {
     float r = 0, g = 0, b = 0;
@@ -424,6 +448,10 @@ static Vector3 g_localPos{};
 static int64_t  g_placeId = 0;       // PlaceId del juego actual
 static int64_t  g_rivalsPlaceId = 0; // PlaceId de Rivals (guardado por el usuario)
 
+// reconexion manual
+static std::atomic<bool> g_forceReattach{ false };
+static std::atomic<bool> g_threadsStarted{ false };
+
 // debug
 int   dbgPlayers    = 0;
 int   dbgValid      = 0;
@@ -457,6 +485,23 @@ HWND FindRobloxWindow() {
         if (p == d->pid && IsWindowVisible(h)) { d->hwnd = h; return FALSE; }
         return TRUE; }, (LPARAM)&ed);
     return ed.hwnd;
+}
+
+static void DrawCornerBox(Vector2 tl, float w, float h, COLORREF col) {
+    float cw = std::max(w * 0.22f, 5.f);
+    float ch = std::max(h * 0.18f, 5.f);
+    // top-left
+    DrawLine(tl,                        {tl.x + cw, tl.y},        col);
+    DrawLine(tl,                        {tl.x, tl.y + ch},        col);
+    // top-right
+    DrawLine({tl.x+w, tl.y},            {tl.x+w-cw, tl.y},        col);
+    DrawLine({tl.x+w, tl.y},            {tl.x+w, tl.y+ch},        col);
+    // bottom-left
+    DrawLine({tl.x, tl.y+h},            {tl.x+cw, tl.y+h},        col);
+    DrawLine({tl.x, tl.y+h},            {tl.x, tl.y+h-ch},        col);
+    // bottom-right
+    DrawLine({tl.x+w, tl.y+h},          {tl.x+w-cw, tl.y+h},      col);
+    DrawLine({tl.x+w, tl.y+h},          {tl.x+w, tl.y+h-ch},      col);
 }
 
 static void BoneLine(const ViewMatrix_t& vm, Vector3 a, Vector3 b,
@@ -820,26 +865,77 @@ static void AimbotThread() {
         // ---- aimbot ----
         bool keyHeld = bAimbot && aimbotKey && (GetAsyncKeyState(aimbotKey) & 0x8000);
         static float accumX = 0.f, accumY = 0.f;
+        static bool  skipNext = false; // espera 1 ciclo tras enviar para que la cámara actualice
         if (!keyHeld) {
-            // solo limpiar acumulador — mantener el lock para re-engancharse rapido
-            accumX = 0.f; accumY = 0.f;
+            accumX = 0.f; accumY = 0.f; skipNext = false;
         }
         if (keyHeld) {
-            if (dist < 0.3f) continue; // deadzone mínimo
+            if (dist < 1.5f) { accumX = 0.f; accumY = 0.f; skipNext = false; continue; }
 
-            // mover una fraccion de la distancia por frame — gain pequeño evita overshoot
-            float baseGain = std::clamp(fAimSmooth / 600.f, 0.03f, 0.18f);
-            float nearDamp  = std::clamp(dist / 8.f, 0.40f, 1.0f); // frena suave en últimos 8px
-            float gain = baseGain * nearDamp;
+            // skipNext: evita acumular doble movimiento antes de que Roblox actualice la cámara
+            if (skipNext) { skipNext = false; continue; }
 
-            accumX += dx * gain; accumY += dy * gain;
+            // /300: 30% ≈ velocidad original, 60% = 2x más rápido, 100% = snap
+            float gain = std::clamp(fAimSmooth / 300.f, 0.005f, 0.35f);
+
+            // nunca mover más que la distancia restante (sin overshoot)
+            float moveX = dx * gain;
+            float moveY = dy * gain;
+            if (fabsf(moveX) > fabsf(dx)) moveX = dx;
+            if (fabsf(moveY) > fabsf(dy)) moveY = dy;
+
+            accumX += moveX; accumY += moveY;
             LONG mx = (LONG)accumX, my = (LONG)accumY;
             accumX -= mx; accumY -= my;
-            if (mx || my) {
-                INPUT inp{}; inp.type = INPUT_MOUSE;
-                inp.mi.dwFlags = MOUSEEVENTF_MOVE;
-                inp.mi.dx = mx; inp.mi.dy = my;
-                SendInput(1, &inp, sizeof(INPUT));
+
+            if (bSilentAim) {
+                // silent aim: escribe Camera.CFrame directamente (sin mover el cursor)
+                uintptr_t dmSA = GetDataModel();
+                if (dmSA) {
+                    uintptr_t wsSA = mem.Read<uintptr_t>(dmSA + Offsets::DataModel::Workspace);
+                    if (!wsSA) wsSA = FindFirstChild(dmSA, "Workspace");
+                    if (wsSA) {
+                        uintptr_t camSA = mem.Read<uintptr_t>(wsSA + Offsets::Workspace::CurrentCamera);
+                        if (camSA) {
+                            Vector3 camPos = mem.Read<Vector3>(camSA + Offsets::Camera::Position);
+                            float tx = headW.x - camPos.x, ty = headW.y - camPos.y, tz = headW.z - camPos.z;
+                            float tLen = sqrtf(tx*tx + ty*ty + tz*tz);
+                            if (tLen > 0.001f) {
+                                tx /= tLen; ty /= tLen; tz /= tLen;
+                                float lx = -tx, ly = -ty, lz = -tz;
+                                float rx = lz, ry = 0.f, rz = -lx;
+                                float rLen = sqrtf(rx*rx + ry*ry + rz*rz);
+                                if (rLen > 0.001f) { rx/=rLen; ry/=rLen; rz/=rLen; }
+                                float ux = ly*rz - lz*ry, uy = lz*rx - lx*rz, uz = lx*ry - ly*rx;
+                                float mat[9] = { rx, ry, rz, ux, uy, uz, lx, ly, lz };
+                                mem.WriteRaw(camSA + Offsets::Camera::CFrame, mat, sizeof(mat));
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (mx || my) {
+                    INPUT inp{}; inp.type = INPUT_MOUSE;
+                    inp.mi.dwFlags = MOUSEEVENTF_MOVE;
+                    inp.mi.dx = mx; inp.mi.dy = my;
+                    SendInput(1, &inp, sizeof(INPUT));
+                    skipNext = true; // dar 8ms para que Roblox procese el input
+                }
+            }
+        }
+
+        // no recoil: compensación downward cuando LMB presionado
+        if (bNoRecoil && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+            static DWORD lastRecoilTick = 0;
+            if (now - lastRecoilTick >= 8) {
+                lastRecoilTick = now;
+                LONG cy = (LONG)(fNoRecoilStr * 0.8f);
+                if (cy > 0) {
+                    INPUT inp{}; inp.type = INPUT_MOUSE;
+                    inp.mi.dwFlags = MOUSEEVENTF_MOVE;
+                    inp.mi.dx = 0; inp.mi.dy = cy;
+                    SendInput(1, &inp, sizeof(INPUT));
+                }
             }
         }
     }
@@ -857,15 +953,17 @@ static void ESPScanThread() {
     };
     while (true) {
         Sleep(16); // ~60Hz
+        uintptr_t dm = GetDataModel();
+        dbgDM = (dm != 0); dbgDMAddr = dm;
         if (!bESP) {
             std::lock_guard<std::mutex> lk(g_espMtx);
             g_espCache.clear();
             continue;
         }
-        uintptr_t dm = GetDataModel();
         uintptr_t ps = dm ? GetPlayersService(dm) : 0;
         if (ps) lastPs = ps;
         else ps = lastPs;
+        dbgPS = (ps != 0); dbgPSAddr = ps;
         if (!ps) { std::lock_guard<std::mutex> lk(g_espMtx); g_espCache.clear(); continue; }
         uintptr_t lp = GetLocalPlayer(ps);
         g_cachedLp = lp;
@@ -881,9 +979,56 @@ static void ESPScanThread() {
                     uintptr_t lhrp = mem.Read<uintptr_t>(lh + Offsets::Humanoid::HumanoidRootPart);
                     if (!lhrp) lhrp = FindFirstChild(lc, "HumanoidRootPart");
                     if (lhrp) localPos = GetPartPosition(lhrp);
+
+                    // WalkSpeed / JumpPower
+                    if (lh) {
+                        if (bWalkSpeed) {
+                            float cur = mem.Read<float>(lh + Offsets::Humanoid::WalkSpeed);
+                            if (fabsf(cur - fWalkSpeed) > 0.5f)
+                                mem.Write(lh + Offsets::Humanoid::WalkSpeed, fWalkSpeed);
+                        }
+                        if (bJumpPower) {
+                            float cur = mem.Read<float>(lh + Offsets::Humanoid::JumpPower);
+                            if (fabsf(cur - fJumpPower) > 0.5f)
+                                mem.Write(lh + Offsets::Humanoid::JumpPower, fJumpPower);
+                        }
+                    }
                 }
             }
         }
+
+        // Noclip — borra el bit CanCollide del Primitive de cada parte del personaje local
+        if (bNoclip && lp) {
+            uintptr_t lc = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
+            if (lc) {
+                auto parts = GetChildren(lc);
+                for (uintptr_t part : parts) {
+                    if (!part || part < 0x10000000000ULL) continue;
+                    uintptr_t prim = mem.Read<uintptr_t>(part + Offsets::BasePart::Primitive);
+                    if (!prim || prim < 0x10000000000ULL) continue;
+                    uint16_t flags = mem.Read<uint16_t>(prim + Offsets::Primitive::Flags);
+                    if (flags & (uint16_t)Offsets::PrimitiveFlags::CanCollide) {
+                        flags &= ~(uint16_t)Offsets::PrimitiveFlags::CanCollide;
+                        mem.Write(prim + Offsets::Primitive::Flags, flags);
+                    }
+                }
+            }
+        }
+
+        // Gravity
+        if (bGravity && dm) {
+            uintptr_t ws = mem.Read<uintptr_t>(dm + Offsets::DataModel::Workspace);
+            if (!ws) ws = FindFirstChild(dm, "Workspace");
+            if (ws) {
+                uintptr_t world = mem.Read<uintptr_t>(ws + Offsets::Workspace::World);
+                if (world) {
+                    float curG = mem.Read<float>(world + Offsets::World::Gravity);
+                    if (fabsf(curG - fGravity) > 1.f)
+                        mem.Write(world + Offsets::World::Gravity, fGravity);
+                }
+            }
+        }
+
         g_cachedLocalPosESP = localPos;
 
         static DWORD lastBoneScan = 0;
@@ -924,6 +1069,12 @@ static void ESPScanThread() {
                 if (!found) continue;
             }
 
+            // filtro de rango
+            if (bEspRangeEnabled && fEspMaxDist > 0.f) {
+                float d = Dist3D(localPos, pi.pos);
+                if (d > fEspMaxDist) continue;
+            }
+
             CachedPlayerESP ce{};
             ce.pos       = pi.pos;
             ce.health    = pi.health;
@@ -931,6 +1082,46 @@ static void ESPScanThread() {
             ce.name      = pi.name;
             ce.character = pi.character;
             ce.hrp       = pi.hrp;
+
+            // velocidad del HRP
+            if (bVelocityESP && pi.hrp) {
+                uintptr_t prim = mem.Read<uintptr_t>(pi.hrp + Offsets::BasePart::Primitive);
+                if (prim) ce.velocity = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
+            }
+
+            // chat bubble: detectar BillboardGui en la Head del personaje
+            if (bChatESP && pi.character) {
+                uintptr_t head = FindFirstChild(pi.character, "Head");
+                if (head) {
+                    for (uintptr_t hc : GetChildren(head)) {
+                        std::string hcn = GetInstanceName(hc);
+                        if (hcn == "BillboardGui" || hcn.find("Chat") != std::string::npos || hcn.find("Bubble") != std::string::npos) {
+                            ce.hasChat = true;
+                            // intentar leer el texto (Frame > TextLabel)
+                            for (uintptr_t frame : GetChildren(hc)) {
+                                for (uintptr_t label : GetChildren(frame)) {
+                                    std::string txt = mem.ReadRbxString(label + Offsets::TextLabel::Text);
+                                    if (!txt.empty() && txt.size() < 200) {
+                                        ce.chatMsg = txt;
+                                        // agregar al log global si es nuevo
+                                        std::lock_guard<std::mutex> lk(g_chatMtx);
+                                        bool dup = false;
+                                        for (auto& e : g_chatLog)
+                                            if (e.name == pi.name && e.msg == txt) { dup = true; break; }
+                                        if (!dup) {
+                                            g_chatLog.push_back({pi.name, txt, GetTickCount()});
+                                            if (g_chatLog.size() > 12) g_chatLog.erase(g_chatLog.begin());
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (!ce.chatMsg.empty()) break;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
 
             ce.headPos = pi.pos; ce.headPos.y += 3.0f;
             ce.feetPos = pi.pos; ce.feetPos.y -= 3.0f;
@@ -957,14 +1148,18 @@ static void ESPScanThread() {
                     break;
                 }
             }
-            // FindFirstChild + cache Primitive pointers cada ~500ms
+            // FindFirstDescendant + cache Primitive pointers cada 100ms
             if (doBoneLookup && bSkeleton && pi.character) {
                 for (int i = 0; i < 21; i++) {
-                    uintptr_t part = FindFirstChild(pi.character, boneNames[i]);
+                    uintptr_t part = FindFirstDescendant(pi.character, boneNames[i]);
                     if (part) {
                         ce.bonePtrs[i] = part;
                         ce.bonePrims[i] = mem.Read<uintptr_t>(part + Offsets::BasePart::Primitive);
                         ce.boneOk[i] = true;
+                    } else {
+                        ce.bonePtrs[i] = 0;
+                        ce.bonePrims[i] = 0;
+                        ce.boneOk[i] = false;
                     }
                 }
             }
@@ -1002,7 +1197,24 @@ static void ESPScanThread() {
                 }
             }
         }
-        { std::lock_guard<std::mutex> lk(g_espMtx); g_espCache = std::move(newCache); }
+        // spectator list: jugadores sin character (muertos / spectating)
+        if (bSpectatorList) {
+            std::vector<std::string> specs;
+            for (uintptr_t player : allP) {
+                if (player == lp) continue;
+                uintptr_t chr = mem.Read<uintptr_t>(player + Offsets::Player::ModelInstance);
+                if (!chr || chr < 0x10000000000ULL) {
+                    std::string nm = GetInstanceName(player);
+                    if (!nm.empty()) specs.push_back(nm);
+                }
+            }
+            std::lock_guard<std::mutex> lk(g_espMtx);
+            g_spectatorList = std::move(specs);
+            g_espCache = std::move(newCache);
+        } else {
+            std::lock_guard<std::mutex> lk(g_espMtx);
+            g_espCache = std::move(newCache);
+        }
 
         // debug info — actualizado desde scan thread, render solo lee
         dbgDM = (dm != 0); dbgDMAddr = dm;
@@ -1022,7 +1234,7 @@ static void ESPScanThread() {
                     int32_t camType = mem.Read<int32_t>(cam + Offsets::Camera::CameraType);
                     if (camType != 0) { // 0 = Classic (tercera persona)
                         int32_t classic = 0;
-                        WriteProcessMemory(mem.proc, (LPVOID)(cam + Offsets::Camera::CameraType), &classic, sizeof(classic), nullptr);
+                        mem.Write(cam + Offsets::Camera::CameraType, classic);
                     }
                 }
             }
@@ -1030,6 +1242,12 @@ static void ESPScanThread() {
 
         // re-attach si DM falla >1s (teleport detection)
         static DWORD dmFailSince = 0;
+
+        // reconexion manual desde UI
+        if (g_forceReattach.exchange(false)) {
+            mem.Attach(L"RobloxPlayerBeta.exe");
+            lastPs = 0; dmFailSince = 0;
+        }
         if (!dm) {
             if (!dmFailSince) dmFailSince = GetTickCount();
             else if (GetTickCount() - dmFailSince > 1000) {
@@ -1048,7 +1266,7 @@ static void ESPScanThread() {
                         for (uintptr_t ch : GetChildren(node)) {
                             for (uintptr_t off : transpOffsets) {
                                 float val = mem.Read<float>(ch + off);
-                                if (val >= 0.f && val < 0.7f) { float one=1.f; WriteProcessMemory(mem.proc,(LPVOID)(ch+off),&one,4,nullptr); }
+                                if (val >= 0.f && val < 0.7f) { float one=1.f; mem.Write(ch+off, one); }
                             }
                             scanFlash(ch, d+1);
                         }
@@ -1062,7 +1280,7 @@ static void ESPScanThread() {
                     std::function<void(uintptr_t,int)> scanSmoke = [&](uintptr_t node, int d) {
                         if (d > 6) return;
                         std::string n = GetInstanceName(node);
-                        if (n == "SmokeEmitter" || n == "Smoke" || n == "SmokeParticle") { uint8_t zero=0; WriteProcessMemory(mem.proc,(LPVOID)(node+0x188),&zero,1,nullptr); }
+                        if (n == "SmokeEmitter" || n == "Smoke" || n == "SmokeParticle") { uint8_t zero=0; mem.Write(node+0x188, zero); }
                         for (uintptr_t ch : GetChildren(node)) scanSmoke(ch, d+1);
                     };
                     scanSmoke(ws, 0);
@@ -1123,9 +1341,18 @@ static void SaveConfig(int mode = -1) {
       << panicKey << "\n"
       << bAntiAFK << "\n"
       << bUserFilter << "\n"
-      << bThirdPerson << "\n"
       << (int)g_targetUsers.size() << "\n";
     for (auto& u : g_targetUsers) f << u << "\n";
+    f << bThirdPerson << "\n"
+      << bWalkSpeed   << "\n" << fWalkSpeed  << "\n"
+      << bJumpPower   << "\n" << fJumpPower  << "\n"
+      << bGravity     << "\n" << fGravity    << "\n"
+      << bVelocityESP << "\n" << bCornerBoxes << "\n"
+      << bEspRangeEnabled << "\n" << fEspMaxDist << "\n"
+      << bNoRecoil    << "\n" << fNoRecoilStr << "\n"
+      << bSilentAim   << "\n" << bSpectatorList << "\n"
+      << bChatESP    << "\n"
+      << bNoclip     << "\n";
 }
 
 static void LoadConfig(int mode = -1) {
@@ -1158,7 +1385,6 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) f >> panicKey;
     if (!f.eof()) f >> bAntiAFK;
     if (!f.eof()) f >> bUserFilter;
-    if (!f.eof()) f >> bThirdPerson;
     { int cnt = 0; if (!f.eof()) f >> cnt;
       g_targetUsers.clear();
       for (int i = 0; i < cnt && !f.eof(); i++) {
@@ -1166,6 +1392,23 @@ static void LoadConfig(int mode = -1) {
           if (!u.empty()) g_targetUsers.push_back(u);
       }
     }
+    if (!f.eof()) f >> bThirdPerson;
+    if (!f.eof()) f >> bWalkSpeed;
+    if (!f.eof()) f >> fWalkSpeed;
+    if (!f.eof()) f >> bJumpPower;
+    if (!f.eof()) f >> fJumpPower;
+    if (!f.eof()) f >> bGravity;
+    if (!f.eof()) f >> fGravity;
+    if (!f.eof()) f >> bVelocityESP;
+    if (!f.eof()) f >> bCornerBoxes;
+    if (!f.eof()) f >> bEspRangeEnabled;
+    if (!f.eof()) f >> fEspMaxDist;
+    if (!f.eof()) f >> bNoRecoil;
+    if (!f.eof()) f >> fNoRecoilStr;
+    if (!f.eof()) f >> bSilentAim;
+    if (!f.eof()) f >> bSpectatorList;
+    if (!f.eof()) f >> bChatESP;
+    if (!f.eof()) f >> bNoclip;
     // clamp para evitar valores absurdos de configs viejas
     if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
     if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
@@ -1216,6 +1459,10 @@ int main() {
       }
     }
     LoadConfig();
+    // opciones que escriben en memoria del juego: siempre empiezan desactivadas
+    bWalkSpeed = false; bJumpPower = false; bGravity = false; bNoclip = false;
+    bThirdPerson = false; bSilentAim = false; bNoRecoil = false;
+    bAntiFlash = false; bAntiSmoke = false;
     { std::ifstream f("ceitus_rivals_placeid.cfg"); if (f) f >> g_rivalsPlaceId; }
 
     // hilo de red: ban check + version check (en background, no bloquea)
@@ -1229,7 +1476,7 @@ int main() {
     RegisterClassExW(&wc);
     HWND menuWnd = CreateWindowExW(WS_EX_TOPMOST, L"RbxMenu", L"ceitus",
         WS_POPUP | WS_VISIBLE | WS_SYSMENU | WS_MINIMIZEBOX,
-        80, 40, 520, 820, nullptr, nullptr, wc.hInstance, nullptr);
+        80, 40, 530, 840, nullptr, nullptr, wc.hInstance, nullptr);
     // rounded corners on Windows 11
     {
         typedef HRESULT(WINAPI* pDwmSetWindowAttribute)(HWND,DWORD,LPCVOID,DWORD);
@@ -1366,6 +1613,8 @@ int main() {
             std::vector<CachedPlayerESP> snap;
             { std::lock_guard<std::mutex> lk(g_espMtx); snap = g_espCache; }
 
+            if (snap.empty()) {
+            }
 
             for (auto& ce : snap) {
                 // posición fresca desde HRP cacheado — 2 RPM rápidos, sin FindFirstChild
@@ -1397,11 +1646,17 @@ int main() {
                 WorldToScreen(vm, pos, centerSc, sw, sh);
                 if (!headFront && !feetFront) continue;
 
+
                 if (bSkeleton) {
-                    // leer posiciones frescas usando bonePtrs (2 RPM por hueso: part→Prim→Pos)
+                    // leer posiciones frescas usando bonePtrs
                     for (int bi = 0; bi < 21; bi++) {
                         if (ce.boneOk[bi] && ce.bonePtrs[bi]) {
-                            ce.bones[bi] = GetPartPosition(ce.bonePtrs[bi]);
+                            Vector3 bp = GetPartPosition(ce.bonePtrs[bi]);
+                            // solo filtrar posición nula (BoneLine también lo hace, doble seguridad)
+                            if (!(bp.x==0.f && bp.y==0.f && bp.z==0.f))
+                                ce.bones[bi] = bp;
+                            else
+                                ce.bones[bi] = ce.bones[bi]; // mantener último valor válido
                         }
                     }
                     // --- stickman style ---
@@ -1468,28 +1723,41 @@ int main() {
                     Vector2 tl    = { midX - boxW * 0.5f, topY };
 
                     if (visH >= 2.f) {
-                        // chams: glow outline grueso alrededor del jugador
+                        // chams: fill solido + glow outline multicapa
                         if (bChams) {
-                            COLORREF glowCol = ce.col;
-                            // outline glow exterior
-                            HPEN glowPen = GetCachedPen(glowCol, 3);
-                            HPEN oldPen = (HPEN)SelectObject(g_memDC, glowPen);
-                            HBRUSH oldBr = (HBRUSH)SelectObject(g_memDC, GetStockObject(NULL_BRUSH));
-                            float pad = 4.f;
-                            ::Rectangle(g_memDC, (int)(tl.x-pad), (int)(tl.y-pad),
-                                (int)(tl.x+boxW+pad), (int)(tl.y+visH+pad));
-                            SelectObject(g_memDC, oldPen);
-                            SelectObject(g_memDC, oldBr);
-                            // relleno semi-opaco (GDI no tiene alpha, usamos líneas horizontales espaciadas)
-                            HPEN fillPen = GetCachedPen(glowCol, 1);
-                            oldPen = (HPEN)SelectObject(g_memDC, fillPen);
-                            for (float fy = tl.y; fy < tl.y + visH; fy += 3.f) {
-                                MoveToEx(g_memDC, (int)tl.x, (int)fy, nullptr);
-                                LineTo(g_memDC, (int)(tl.x + boxW), (int)fy);
+                            COLORREF bc = ce.col;
+                            BYTE r = GetRValue(bc), g2 = GetGValue(bc), b2 = GetBValue(bc);
+                            // fill denso (cada 1px) con color oscuro
+                            COLORREF darkFill = RGB(r/4, g2/4, b2/4);
+                            HPEN fp = GetCachedPen(darkFill, 1);
+                            HPEN oldPen = (HPEN)SelectObject(g_memDC, fp);
+                            for (float fy = tl.y + 1.f; fy < tl.y + visH - 1.f; fy += 1.f) {
+                                MoveToEx(g_memDC, (int)(tl.x+1), (int)fy, nullptr);
+                                LineTo(g_memDC, (int)(tl.x+boxW-1), (int)fy);
                             }
                             SelectObject(g_memDC, oldPen);
+                            // glow outlines: 4 capas (exterior oscuro → interior brillante)
+                            struct { int pad; int thick; COLORREF col; } layers[] = {
+                                { 6, 1, RGB(r/3, g2/3, b2/3) },
+                                { 4, 1, RGB(r/2, g2/2, b2/2) },
+                                { 2, 2, bc                    },
+                                { 0, 3, RGB(std::min(255,(int)r+80), std::min(255,(int)g2+80), std::min(255,(int)b2+80)) },
+                            };
+                            HBRUSH oldBr = (HBRUSH)SelectObject(g_memDC, GetStockObject(NULL_BRUSH));
+                            for (auto& lay : layers) {
+                                HPEN lp = GetCachedPen(lay.col, lay.thick);
+                                oldPen = (HPEN)SelectObject(g_memDC, lp);
+                                ::Rectangle(g_memDC,
+                                    (int)(tl.x-lay.pad), (int)(tl.y-lay.pad),
+                                    (int)(tl.x+boxW+lay.pad), (int)(tl.y+visH+lay.pad));
+                                SelectObject(g_memDC, oldPen);
+                            }
+                            SelectObject(g_memDC, oldBr);
                         }
-                        if (bBoxes) DrawBox(tl, boxW, visH, ce.col);
+                        if (bBoxes) {
+                            if (bCornerBoxes) DrawCornerBox(tl, boxW, visH, ce.col);
+                            else DrawBox(tl, boxW, visH, ce.col);
+                        }
                         if (bHealthBar) {
                             float maxHp = ce.maxHealth > 0.f ? ce.maxHealth : 100.f;
                             float pct = std::clamp(ce.health / maxHp, 0.f, 1.f);
@@ -1500,12 +1768,29 @@ int main() {
                     } else {
                         DrawDot({ midX, (topY + bottomY) * 0.5f }, 3, ce.col);
                     }
+                    if (bChatESP && ce.hasChat) {
+                        std::string chatLabel = ce.chatMsg.empty() ? "..." : ce.chatMsg;
+                        if (chatLabel.size() > 30) chatLabel = chatLabel.substr(0, 30) + "..";
+                        DrawText2D({ midX, topY - 28.f }, "[" + chatLabel + "]", RGB(255,240,100));
+                    }
+                    if (bVelocityESP) {
+                        float spd = sqrtf(ce.velocity.x*ce.velocity.x + ce.velocity.z*ce.velocity.z);
+                        char vbuf[32]; snprintf(vbuf, sizeof(vbuf), "%.0f m/s", spd);
+                        float yOff = (bChatESP && ce.hasChat) ? -42.f : -28.f;
+                        DrawText2D({ midX, topY + yOff }, vbuf, RGB(160,200,255));
+                    }
                     if (bNames) {
                         std::string label = ce.name;
                         if (bDistance) {
                             float dist = Dist3D(localPos, pos);
                             char dbuf[32]; snprintf(dbuf, sizeof(dbuf), " [%.0fm]", dist);
                             label += dbuf;
+                        }
+                        // debug: contar huesos válidos
+                        if (bSkeleton) {
+                            int bc = 0; for (int i=0;i<21;i++) if(ce.boneOk[i]) bc++;
+                            char bbuf[16]; snprintf(bbuf,sizeof(bbuf)," [b:%d]",bc);
+                            label += bbuf;
                         }
                         DrawText2D({ midX, topY - 16.f }, label, ce.col);
                     }
@@ -1519,6 +1804,35 @@ int main() {
                             label += dbuf;
                         }
                         DrawText2D({ centerSc.x - 20.f, centerSc.y - 12.f }, label, ce.col);
+                    }
+                }
+            }
+
+            // spectator list: jugadores muertos / espectando
+            if (bSpectatorList) {
+                std::vector<std::string> specs;
+                { std::lock_guard<std::mutex> lk(g_espMtx); specs = g_spectatorList; }
+                if (!specs.empty()) {
+                    float sx = sw - 175.f, sy = 10.f;
+                    DrawText2D({sx, sy}, "Espectadores", RGB(180,180,180));
+                    for (int i = 0; i < (int)specs.size() && i < 12; i++)
+                        DrawText2D({sx, sy + 15.f*(i+1)}, specs[i], RGB(255,200,100));
+                }
+            }
+
+            // panel de chat: mensajes recientes
+            if (bChatESP) {
+                std::vector<ChatEntry> log;
+                { std::lock_guard<std::mutex> lk(g_chatMtx); log = g_chatLog; }
+                if (!log.empty()) {
+                    DWORD nowC = GetTickCount();
+                    float cx = 10.f, cy = sh - 20.f;
+                    for (int i = (int)log.size()-1; i >= 0 && cy > sh*0.5f; i--) {
+                        if (nowC - log[i].time > 10000) break; // ocultar mensajes de más de 10s
+                        std::string line = "[" + log[i].name + "] " + log[i].msg;
+                        if (line.size() > 60) line = line.substr(0, 60) + "..";
+                        DrawText2D({cx, cy}, line, RGB(255,240,100));
+                        cy -= 15.f;
                     }
                 }
             }
@@ -1656,52 +1970,53 @@ int main() {
         // ---- estilo visual premium ----
         {
             ImGuiStyle& st = ImGui::GetStyle();
-            st.WindowRounding    = 12.f;  st.FrameRounding    = 8.f;
-            st.GrabRounding      = 8.f;   st.ScrollbarRounding = 8.f;
-            st.TabRounding       = 6.f;   st.ChildRounding     = 8.f;
+            st.WindowRounding    = 10.f;  st.FrameRounding    = 6.f;
+            st.GrabRounding      = 6.f;   st.ScrollbarRounding = 6.f;
+            st.TabRounding       = 6.f;   st.ChildRounding     = 6.f;
             st.PopupRounding     = 8.f;
             st.WindowBorderSize  = 0.f;   st.FrameBorderSize   = 0.f;
-            st.ItemSpacing       = ImVec2(10, 8);
+            st.ItemSpacing       = ImVec2(8, 7);
             st.FramePadding      = ImVec2(10, 6);
-            st.WindowPadding     = ImVec2(18, 14);
-            st.ScrollbarSize     = 10.f;
-            st.GrabMinSize       = 10.f;
+            st.WindowPadding     = ImVec2(16, 12);
+            st.ScrollbarSize     = 8.f;
+            st.GrabMinSize       = 8.f;
+            st.TabBarBorderSize  = 0.f;
             ImVec4* c = st.Colors;
-            c[ImGuiCol_WindowBg]         = ImVec4(0.06f,0.06f,0.09f,1.f);
-            c[ImGuiCol_ChildBg]          = ImVec4(0.08f,0.08f,0.12f,1.f);
-            c[ImGuiCol_PopupBg]          = ImVec4(0.08f,0.08f,0.12f,0.98f);
-            c[ImGuiCol_Border]           = ImVec4(0.15f,0.15f,0.25f,0.5f);
-            c[ImGuiCol_TitleBg]          = ImVec4(0.06f,0.06f,0.09f,1.f);
-            c[ImGuiCol_TitleBgActive]    = ImVec4(0.06f,0.06f,0.09f,1.f);
-            c[ImGuiCol_FrameBg]          = ImVec4(0.10f,0.10f,0.16f,1.f);
-            c[ImGuiCol_FrameBgHovered]   = ImVec4(0.15f,0.14f,0.24f,1.f);
-            c[ImGuiCol_FrameBgActive]    = ImVec4(0.20f,0.18f,0.32f,1.f);
-            c[ImGuiCol_CheckMark]        = ImVec4(0.40f,0.75f,1.f,1.f);
-            c[ImGuiCol_SliderGrab]       = ImVec4(0.35f,0.65f,1.f,1.f);
-            c[ImGuiCol_SliderGrabActive] = ImVec4(0.50f,0.80f,1.f,1.f);
-            c[ImGuiCol_Button]           = ImVec4(0.14f,0.16f,0.28f,1.f);
-            c[ImGuiCol_ButtonHovered]    = ImVec4(0.22f,0.28f,0.52f,1.f);
-            c[ImGuiCol_ButtonActive]     = ImVec4(0.30f,0.38f,0.68f,1.f);
-            c[ImGuiCol_Tab]              = ImVec4(0.08f,0.08f,0.14f,1.f);
-            c[ImGuiCol_TabHovered]       = ImVec4(0.22f,0.22f,0.42f,1.f);
-            c[ImGuiCol_TabSelected]      = ImVec4(0.16f,0.16f,0.30f,1.f);
-            c[ImGuiCol_Header]           = ImVec4(0.14f,0.14f,0.26f,1.f);
-            c[ImGuiCol_HeaderHovered]    = ImVec4(0.20f,0.20f,0.38f,1.f);
-            c[ImGuiCol_HeaderActive]     = ImVec4(0.26f,0.26f,0.48f,1.f);
-            c[ImGuiCol_Separator]        = ImVec4(0.15f,0.15f,0.25f,0.6f);
-            c[ImGuiCol_SeparatorHovered] = ImVec4(0.30f,0.30f,0.60f,0.8f);
-            c[ImGuiCol_SeparatorActive]  = ImVec4(0.40f,0.40f,0.80f,1.f);
-            c[ImGuiCol_ScrollbarBg]      = ImVec4(0.04f,0.04f,0.07f,1.f);
-            c[ImGuiCol_ScrollbarGrab]    = ImVec4(0.20f,0.20f,0.35f,1.f);
-            c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.28f,0.28f,0.48f,1.f);
-            c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.35f,0.35f,0.58f,1.f);
-            c[ImGuiCol_Text]             = ImVec4(0.88f,0.88f,0.92f,1.f);
-            c[ImGuiCol_TextDisabled]     = ImVec4(0.40f,0.40f,0.50f,1.f);
+            c[ImGuiCol_WindowBg]         = ImVec4(0.05f,0.05f,0.08f,1.f);
+            c[ImGuiCol_ChildBg]          = ImVec4(0.07f,0.07f,0.11f,1.f);
+            c[ImGuiCol_PopupBg]          = ImVec4(0.07f,0.07f,0.11f,0.98f);
+            c[ImGuiCol_Border]           = ImVec4(0.18f,0.18f,0.28f,0.6f);
+            c[ImGuiCol_TitleBg]          = ImVec4(0.05f,0.05f,0.08f,1.f);
+            c[ImGuiCol_TitleBgActive]    = ImVec4(0.05f,0.05f,0.08f,1.f);
+            c[ImGuiCol_FrameBg]          = ImVec4(0.10f,0.10f,0.17f,1.f);
+            c[ImGuiCol_FrameBgHovered]   = ImVec4(0.14f,0.14f,0.24f,1.f);
+            c[ImGuiCol_FrameBgActive]    = ImVec4(0.18f,0.18f,0.30f,1.f);
+            c[ImGuiCol_CheckMark]        = ImVec4(0.30f,0.85f,0.55f,1.f);
+            c[ImGuiCol_SliderGrab]       = ImVec4(0.35f,0.60f,1.f,1.f);
+            c[ImGuiCol_SliderGrabActive] = ImVec4(0.50f,0.75f,1.f,1.f);
+            c[ImGuiCol_Button]           = ImVec4(0.13f,0.15f,0.26f,1.f);
+            c[ImGuiCol_ButtonHovered]    = ImVec4(0.20f,0.26f,0.50f,1.f);
+            c[ImGuiCol_ButtonActive]     = ImVec4(0.28f,0.36f,0.65f,1.f);
+            c[ImGuiCol_Tab]              = ImVec4(0.07f,0.07f,0.12f,1.f);
+            c[ImGuiCol_TabHovered]       = ImVec4(0.16f,0.20f,0.36f,1.f);
+            c[ImGuiCol_TabSelected]      = ImVec4(0.12f,0.16f,0.30f,1.f);
+            c[ImGuiCol_Header]           = ImVec4(0.12f,0.14f,0.24f,1.f);
+            c[ImGuiCol_HeaderHovered]    = ImVec4(0.18f,0.22f,0.38f,1.f);
+            c[ImGuiCol_HeaderActive]     = ImVec4(0.24f,0.28f,0.48f,1.f);
+            c[ImGuiCol_Separator]        = ImVec4(0.14f,0.14f,0.22f,0.8f);
+            c[ImGuiCol_SeparatorHovered] = ImVec4(0.28f,0.40f,0.70f,0.9f);
+            c[ImGuiCol_SeparatorActive]  = ImVec4(0.38f,0.55f,1.f,1.f);
+            c[ImGuiCol_ScrollbarBg]      = ImVec4(0.03f,0.03f,0.06f,1.f);
+            c[ImGuiCol_ScrollbarGrab]    = ImVec4(0.18f,0.18f,0.32f,1.f);
+            c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.26f,0.26f,0.46f,1.f);
+            c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.33f,0.33f,0.55f,1.f);
+            c[ImGuiCol_Text]             = ImVec4(0.90f,0.90f,0.94f,1.f);
+            c[ImGuiCol_TextDisabled]     = ImVec4(0.38f,0.38f,0.48f,1.f);
         }
 
         // ---- pantalla de ban ----
         if (g_hwIdBanned) {
-            ImGui::SetNextWindowSize({520, 820}, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({530, 840}, ImGuiCond_Always);
             ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
             ImGui::Begin("##ban", nullptr,
                 ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoTitleBar);
@@ -1744,7 +2059,7 @@ int main() {
                 ImGui::TextColored(col, "%s", txt);
             };
 
-            ImGui::SetNextWindowSize({520, 820}, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({530, 840}, ImGuiCond_Always);
             ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
             ImGui::Begin("##keywin", nullptr,
                 ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|
@@ -1922,15 +2237,21 @@ int main() {
             static bool robloxStarted = false;
             if (!robloxStarted) {
                 robloxStarted = true;
-                // esperar Roblox en hilo para no bloquear el render
+                // esperar Roblox y arrancar hilos — la ventana se busca en paralelo
                 std::thread([&](){
                     while (!mem.Attach(L"RobloxPlayerBeta.exe"))
                         std::this_thread::sleep_for(std::chrono::seconds(2));
-                    while (!rbxWnd) { rbxWnd = FindRobloxWindow(); std::this_thread::sleep_for(std::chrono::milliseconds(500)); }
-                    StartOffsetUpdater(L"roblox");
-                    std::thread(VMReaderThread).detach();
-                    std::thread(AimbotThread).detach();
-                    std::thread(ESPScanThread).detach();
+                    // hilos arrancan tan pronto como attach ok (no esperan la ventana)
+                    if (!g_threadsStarted.exchange(true)) {
+                        StartOffsetUpdater(L"roblox");
+                        std::thread(VMReaderThread).detach();
+                        std::thread(AimbotThread).detach();
+                        std::thread(ESPScanThread).detach();
+                    }
+                    // seguir buscando la ventana en segundo plano para el overlay
+                    std::thread([&](){
+                        while (!rbxWnd) { rbxWnd = FindRobloxWindow(); std::this_thread::sleep_for(std::chrono::milliseconds(500)); }
+                    }).detach();
                 }).detach();
             }
             if (rbxWnd && !g_overlay) {
@@ -1938,7 +2259,7 @@ int main() {
             }
         }
 
-        ImGui::SetNextWindowSize({520, 820}, ImGuiCond_Always);
+        ImGui::SetNextWindowSize({530, 840}, ImGuiCond_Always);
         ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
         ImGui::Begin("##main", nullptr,
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -1948,12 +2269,16 @@ int main() {
         ImVec2 wp = ImGui::GetWindowPos();
         ImVec2 ws = ImGui::GetWindowSize();
 
-        // header gradient
-        dl->AddRectFilledMultiColor(wp, {wp.x+ws.x, wp.y+70},
-            IM_COL32(18,22,55,255), IM_COL32(14,18,45,255),
-            IM_COL32(15,15,25,255), IM_COL32(15,15,25,255));
-        // accent line
-        dl->AddRectFilled(wp, {wp.x+ws.x, wp.y+3}, IM_COL32(80,140,255,200));
+        // header gradient - deeper, richer
+        dl->AddRectFilledMultiColor(wp, {wp.x+ws.x, wp.y+72},
+            IM_COL32(14,18,48,255), IM_COL32(10,14,38,255),
+            IM_COL32(12,12,20,255), IM_COL32(12,12,20,255));
+        // accent line top - cyan-blue gradient
+        dl->AddRectFilledMultiColor(wp, {wp.x+ws.x, wp.y+3},
+            IM_COL32(50,180,255,255), IM_COL32(80,140,255,255),
+            IM_COL32(80,140,255,255), IM_COL32(50,180,255,255));
+        // subtle bottom border on header
+        dl->AddRectFilled({wp.x, wp.y+72}, {wp.x+ws.x, wp.y+73}, IM_COL32(40,50,90,180));
 
         // drag area
         {
@@ -1993,34 +2318,91 @@ int main() {
         }
 
         // header title
-        ImGui::SetCursorPos({20, 18});
+        ImGui::SetCursorPos({18, 16});
         ImGui::PushFont(ImGui::GetFont());
         float oldS = ImGui::GetFont()->Scale;
-        ImGui::GetFont()->Scale = 1.5f;
+        ImGui::GetFont()->Scale = 1.6f;
         ImGui::PushFont(ImGui::GetFont());
-        ImGui::TextColored(ImVec4(0.45f,0.70f,1.f,1.f), "CEITUS");
+        ImGui::TextColored(ImVec4(0.40f,0.80f,1.f,1.f), "CEITUS");
         ImGui::PopFont();
         ImGui::GetFont()->Scale = oldS;
         ImGui::PopFont();
-        ImGui::SameLine();
-        ImGui::SetCursorPosY(26);
-        ImGui::TextColored(ImVec4(0.40f,0.42f,0.55f,1.f), "v" CEITUS_VERSION);
+        ImGui::SameLine(0, 6);
+        ImGui::SetCursorPosY(24);
+        ImGui::TextColored(ImVec4(0.35f,0.40f,0.58f,1.f), "v" CEITUS_VERSION);
 
-        // status indicator
+        // status pill
         {
-            bool attached = dbgDM && dbgPS;
-            ImVec2 sp = {wp.x + ws.x - 150, wp.y + 46};
-            dl->AddCircleFilled(sp, 5.f, attached ? IM_COL32(60,220,100,255) : IM_COL32(220,60,60,255));
-            dl->AddText({sp.x+12, sp.y-8}, attached ? IM_COL32(60,220,100,200) : IM_COL32(220,100,100,200),
-                attached ? "Conectado" : "Buscando...");
+            bool attached = (mem.proc != nullptr); // conectado si tenemos handle a Roblox
+            // pill background
+            ImVec2 pb = {wp.x + ws.x - 220, wp.y + 20};
+            ImVec2 pe = {pb.x + 112,          pb.y + 22};
+            dl->AddRectFilled(pb, pe,
+                attached ? IM_COL32(20,55,30,200) : IM_COL32(55,20,20,200), 11.f);
+            dl->AddRect(pb, pe,
+                attached ? IM_COL32(40,180,80,120) : IM_COL32(180,40,40,120), 11.f);
+            // dot
+            ImVec2 dot = {pb.x + 14, pb.y + 11};
+            dl->AddCircleFilled(dot, 4.5f, attached ? IM_COL32(50,220,100,255) : IM_COL32(220,60,60,255));
+            // text
+            ImVec2 tp = {pb.x + 24, pb.y + 4};
+            dl->AddText(tp, attached ? IM_COL32(80,220,120,230) : IM_COL32(220,90,90,230),
+                attached ? "Conectado" : "Sin Roblox");
+
+            // player count badge (if attached)
+            if (attached && dbgPlayers > 0) {
+                char pc[16]; snprintf(pc, sizeof(pc), "%d jugadores", dbgPlayers);
+                ImVec2 pp = {wp.x + ws.x - 220, wp.y + 48};
+                dl->AddText(pp, IM_COL32(80,100,150,180), pc);
+            }
+
+            // boton Conectar cuando no está adjunto
+            if (!attached) {
+                ImGui::SetCursorPos({wp.x + ws.x - 216 - wp.x, 48});
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.50f,0.18f,0.18f,0.85f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f,0.22f,0.22f,0.95f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.90f,0.28f,0.28f,1.f));
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
+                if (ImGui::Button("Conectar##pill", {108, 20})) {
+                    g_forceReattach = true;
+                    // si los hilos no arrancaron aún (Roblox no estaba al inicio), intentar attach directo
+                    if (!g_threadsStarted) {
+                        std::thread([](){
+                            if (mem.Attach(L"RobloxPlayerBeta.exe")) {
+                                if (!g_threadsStarted.exchange(true)) {
+                                    StartOffsetUpdater(L"roblox");
+                                    std::thread(VMReaderThread).detach();
+                                    std::thread(AimbotThread).detach();
+                                    std::thread(ESPScanThread).detach();
+                                }
+                                std::thread([](){
+                                    while (!g_rbxWnd) { g_rbxWnd = FindRobloxWindow(); Sleep(500); }
+                                }).detach();
+                            }
+                        }).detach();
+                    }
+                }
+                ImGui::PopStyleVar();
+                ImGui::PopStyleColor(3);
+            }
         }
 
-        ImGui::SetCursorPos({18, 78});
+        ImGui::SetCursorPos({16, 80});
+
+        // helper: section header con barra de acento lateral
+        auto SecHeader = [](ImDrawList* _dl, const char* label, ImU32 barCol = IM_COL32(60,160,255,220)) {
+            ImGui::Dummy({0, 3});
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            _dl->AddRectFilled(p, {p.x+3, p.y+15}, barCol, 2.f);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 9);
+            ImGui::TextColored(ImVec4(0.55f,0.72f,1.f,1.f), "%s", label);
+            ImGui::Dummy({0, 2});
+        };
 
         // game selector section
-        ImGui::BeginChild("##content", {ws.x - 36, ws.y - 90}, false);
+        ImGui::BeginChild("##content", {ws.x - 32, ws.y - 92}, false);
 
-        ImGui::TextColored(ImVec4(0.40f,0.45f,0.60f,1.f), "JUEGO");
+        SecHeader(dl, "MODO DE JUEGO");
         ImGui::SetNextItemWidth(-1);
         { static int64_t lastAutoPlace = 0;
           if (g_placeId != 0 && g_placeId != lastAutoPlace) {
@@ -2061,51 +2443,72 @@ int main() {
         ImGui::Spacing();
 
         // ---- tabs ----
+        ImGui::PushStyleColor(ImGuiCol_Tab,         ImVec4(0.07f,0.07f,0.12f,1.f));
+        ImGui::PushStyleColor(ImGuiCol_TabHovered,  ImVec4(0.18f,0.22f,0.38f,1.f));
+        ImGui::PushStyleColor(ImGuiCol_TabSelected, ImVec4(0.12f,0.18f,0.34f,1.f));
         if (ImGui::BeginTabBar("##tabs")) {
 
             // ======= TAB: VISUAL =======
-            if (ImGui::BeginTabItem("  Visual  ")) {
+            if (ImGui::BeginTabItem(" Visual ")) {
                 ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "ESP");
-                ImGui::Spacing();
+                SecHeader(dl, "ESP");
                 ImGui::Checkbox("ESP activado", &bESP);
                 if (bESP) {
                     ImGui::Indent(12.f);
-                    ImGui::SetNextItemWidth(220.f);
+                    ImGui::SetNextItemWidth(230.f);
                     static const char* espColors[] = { "Por equipo", "Rojo", "Azul", "Naranja", "Verde", "Rainbow" };
-                    ImGui::Combo("Color", &espColorMode, espColors, 6);
+                    ImGui::Combo("Color##ec", &espColorMode, espColors, 6);
                     ImGui::Spacing();
-                    ImGui::Checkbox("Cajas",        &bBoxes);     ImGui::SameLine(200); ImGui::Checkbox("Nombres",    &bNames);
-                    ImGui::Checkbox("Barra de vida",&bHealthBar);  ImGui::SameLine(200); ImGui::Checkbox("Distancia",  &bDistance);
-                    ImGui::Checkbox("Skeleton",     &bSkeleton);  ImGui::SameLine(200); ImGui::Checkbox("Snaplines",  &bSnaplines);
-                    ImGui::Checkbox("Chams (glow)", &bChams);
+                    // 2-column grid para opciones ESP
+                    ImGui::BeginTable("##espopts", 2, ImGuiTableFlags_None, {0, 0});
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Cajas",        &bBoxes);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Nombres",      &bNames);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Barra de vida",&bHealthBar);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Distancia",    &bDistance);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Skeleton",     &bSkeleton);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Snaplines",    &bSnaplines);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Chams (glow)", &bChams);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Velocidad",    &bVelocityESP);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Corner Boxes", &bCornerBoxes);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Espectadores", &bSpectatorList);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Chat ESP",     &bChatESP);
+                    ImGui::EndTable();
+                    ImGui::Spacing();
+                    ImGui::Checkbox("Filtro por rango##esprange", &bEspRangeEnabled);
+                    if (bEspRangeEnabled) {
+                        ImGui::Indent(12.f);
+                        ImGui::SetNextItemWidth(210.f);
+                        ImGui::SliderFloat("Dist max (m)##espr", &fEspMaxDist, 50.f, 2000.f, "%.0f");
+                        ImGui::Unindent(12.f);
+                    }
                     ImGui::Unindent(12.f);
                 }
-                ImGui::Spacing(); ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "RADAR");
                 ImGui::Spacing();
+                SecHeader(dl, "RADAR", IM_COL32(80,200,120,220));
                 ImGui::Checkbox("Radar (mini-mapa)", &bRadar);
                 if (bRadar) {
                     ImGui::Indent(12.f);
-                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SetNextItemWidth(210.f);
                     ImGui::SliderFloat("Rango (studs)", &fRadarRange, 50.f, 500.f, "%.0f");
                     ImGui::Unindent(12.f);
                 }
                 if (gameMode == 1) {
-                    ImGui::Spacing(); ImGui::Spacing();
-                    ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "COUNTERBLOX");
                     ImGui::Spacing();
-                    ImGui::Checkbox("Anti-Flash", &bAntiFlash);
-                    ImGui::SameLine(200);
-                    ImGui::Checkbox("Anti-Humo",  &bAntiSmoke);
+                    SecHeader(dl, "COUNTERBLOX", IM_COL32(255,160,40,220));
+                    ImGui::TextColored(ImVec4(1.f,0.75f,0.2f,0.9f), "Escribe en memoria del juego — bajo tu propio riesgo");
+                    ImGui::Spacing();
+                    ImGui::BeginTable("##cbopts", 2, ImGuiTableFlags_None, {0, 0});
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Anti-Flash", &bAntiFlash);
+                    ImGui::TableNextColumn(); ImGui::Checkbox("Anti-Humo",  &bAntiSmoke);
+                    ImGui::EndTable();
                 }
                 ImGui::EndTabItem();
             }
 
             // ======= TAB: COMBATE =======
-            if (ImGui::BeginTabItem("  Combate  ")) {
+            if (ImGui::BeginTabItem(" Combate ")) {
                 ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "AIMBOT");
+                SecHeader(dl, "AIMBOT", IM_COL32(220,80,80,220));
                 ImGui::Spacing();
                 char aimbotLabel[48];
                 if (aimbotKey == VK_XBUTTON1) snprintf(aimbotLabel,sizeof(aimbotLabel),"Aimbot [Mouse4]");
@@ -2152,9 +2555,8 @@ int main() {
                     }
                     ImGui::Unindent(12.f);
                 }
-                ImGui::Spacing(); ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "TRIGGERBOT");
                 ImGui::Spacing();
+                SecHeader(dl, "TRIGGERBOT", IM_COL32(220,140,40,220));
                 ImGui::Checkbox("Triggerbot (auto-disparo)", &bTriggerbot);
                 if (bTriggerbot) {
                     ImGui::Indent(12.f);
@@ -2162,22 +2564,60 @@ int main() {
                     ImGui::SliderFloat("Radio (px)", &fTriggerFov, 2.f, 40.f, "%.0f");
                     ImGui::Unindent(12.f);
                 }
-                ImGui::Spacing(); ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "EXTRAS");
                 ImGui::Spacing();
+                SecHeader(dl, "MOVIMIENTO", IM_COL32(80,200,120,220));
                 ImGui::Checkbox("Prediccion de movimiento", &bPrediction);
                 if (bPrediction) {
                     ImGui::Indent(12.f);
-                    ImGui::SetNextItemWidth(200.f);
-                    ImGui::SliderFloat("Tiempo (s)", &fPrediction, 0.01f, 0.3f, "%.2f");
+                    ImGui::SetNextItemWidth(210.f);
+                    ImGui::SliderFloat("Tiempo (s)##pred", &fPrediction, 0.01f, 0.3f, "%.2f");
                     ImGui::Unindent(12.f);
                 }
-                ImGui::Checkbox("Bunny Hop [Space]", &bBhop);
-                ImGui::Checkbox("Tercera Persona", &bThirdPerson);
-                ImGui::Checkbox("Anti-AFK", &bAntiAFK);
-                ImGui::Spacing(); ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "HUD");
+                ImGui::BeginTable("##movopts", 2, ImGuiTableFlags_None, {0, 0});
+                ImGui::TableNextColumn(); ImGui::Checkbox("Bunny Hop [Space]", &bBhop);
+                ImGui::TableNextColumn(); ImGui::Checkbox("Anti-AFK",          &bAntiAFK);
+                ImGui::TableNextColumn(); ImGui::Checkbox("Tercera Persona",   &bThirdPerson);
+                ImGui::EndTable();
                 ImGui::Spacing();
+                SecHeader(dl, "JUGADOR", IM_COL32(80,220,180,220));
+                ImGui::TextColored(ImVec4(1.f,0.75f,0.2f,0.9f), "Escribe en memoria del juego — bajo tu propio riesgo");
+                ImGui::Spacing();
+                ImGui::Checkbox("WalkSpeed personalizado", &bWalkSpeed);
+                if (bWalkSpeed) {
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderFloat("Velocidad##ws", &fWalkSpeed, 1.f, 200.f, "%.0f");
+                    ImGui::Unindent(12.f);
+                }
+                ImGui::Checkbox("JumpPower personalizado", &bJumpPower);
+                if (bJumpPower) {
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderFloat("Fuerza salto##jp", &fJumpPower, 1.f, 500.f, "%.0f");
+                    ImGui::Unindent(12.f);
+                }
+                ImGui::Checkbox("Gravedad personalizada", &bGravity);
+                if (bGravity) {
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderFloat("Gravedad##grav", &fGravity, 0.f, 500.f, "%.0f");
+                    ImGui::Unindent(12.f);
+                }
+                ImGui::Checkbox("Noclip", &bNoclip);
+                ImGui::Spacing();
+                SecHeader(dl, "ARMAS", IM_COL32(220,80,120,220));
+                ImGui::BeginTable("##wpnopts", 2, ImGuiTableFlags_None, {0, 0});
+                ImGui::TableNextColumn(); ImGui::Checkbox("No Recoil",  &bNoRecoil);
+                ImGui::TableNextColumn(); ImGui::Checkbox("Silent Aim", &bSilentAim);
+                ImGui::EndTable();
+                if (bNoRecoil) {
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderFloat("Fuerza##recoil", &fNoRecoilStr, 0.1f, 5.0f, "%.1f");
+                    ImGui::Unindent(12.f);
+                }
+                ImGui::Spacing();
+                SecHeader(dl, "HUD", IM_COL32(160,100,220,220));
                 ImGui::Checkbox("Crosshair", &bCrosshair);
                 if (bCrosshair) {
                     ImGui::Indent(12.f);
@@ -2187,8 +2627,8 @@ int main() {
                     ImGui::Unindent(12.f);
                 }
                 ImGui::Checkbox("Hitmarker", &bHitmarker); ImGui::SameLine(200); ImGui::Checkbox("Kill Feed", &bKillfeed);
-                ImGui::Spacing(); ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "PANIC KEY");
+                ImGui::Spacing();
+                SecHeader(dl, "PANIC KEY", IM_COL32(200,60,60,220));
                 ImGui::Spacing();
                 {
                     static bool waitPanicKey = false;
@@ -2215,27 +2655,36 @@ int main() {
             }
 
             // ======= TAB: INFO =======
-            if (ImGui::BeginTabItem("  Info  ")) {
+            if (ImGui::BeginTabItem(" Info ")) {
                 ImGui::Spacing();
-
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "ESTADO");
-                ImGui::Spacing();
+                SecHeader(dl, "ESTADO");
                 {
                     ImDrawList* d = ImGui::GetWindowDrawList();
-                    ImVec2 p = ImGui::GetCursorScreenPos();
                     bool ok = dbgDM && dbgPS && dbgVmSum > 0.f;
-                    d->AddCircleFilled({p.x+6, p.y+8}, 5.f,
-                        ok ? IM_COL32(60,220,100,255) : IM_COL32(220,70,70,255));
-                    ImGui::Indent(18.f);
-                    ImGui::TextColored(ok ? ImVec4(0.40f,0.85f,0.50f,1.f) : ImVec4(0.85f,0.35f,0.35f,1.f),
-                        ok ? "Conectado" : "Desconectado");
-                    ImGui::Unindent(18.f);
+                    // card de estado
+                    ImVec2 cp = ImGui::GetCursorScreenPos();
+                    d->AddRectFilled(cp, {cp.x + 490, cp.y + 52},
+                        ok ? IM_COL32(15,40,22,220) : IM_COL32(40,14,14,220), 8.f);
+                    d->AddRect(cp, {cp.x + 490, cp.y + 52},
+                        ok ? IM_COL32(40,160,70,100) : IM_COL32(160,40,40,100), 8.f);
+                    d->AddCircleFilled({cp.x+18, cp.y+14}, 6.f,
+                        ok ? IM_COL32(50,220,90,255) : IM_COL32(220,60,60,255));
+                    ImGui::Dummy({0, 4});
+                    ImGui::Indent(32.f);
+                    ImGui::TextColored(ok ? ImVec4(0.35f,0.90f,0.50f,1.f) : ImVec4(0.90f,0.30f,0.30f,1.f),
+                        ok ? "Conectado a Roblox" : "Roblox no detectado");
+                    ImGui::TextColored(ImVec4(0.45f,0.50f,0.65f,1.f), "Jugadores: %d  |  PlaceId: %lld", dbgPlayers, g_placeId);
+                    ImGui::Unindent(32.f);
+                    ImGui::Dummy({0, 8});
                 }
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.55f,0.58f,0.70f,1.f), "Jugadores: %d", dbgPlayers);
 
-                ImGui::Spacing(); ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.40f,0.50f,0.70f,1.f), "JUEGO");
+                SecHeader(dl, "CUENTA");
+                ImGui::TextColored(ImVec4(0.45f,0.50f,0.65f,1.f), "ID:    "); ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.70f,0.75f,0.90f,1.f), "%s", g_uid.empty() ? "-" : g_uid.c_str());
+                ImGui::TextColored(ImVec4(0.45f,0.50f,0.65f,1.f), "HWID:  "); ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.50f,0.55f,0.70f,1.f), "%s", HWIDString().c_str());
+                ImGui::Spacing();
+                SecHeader(dl, "JUEGO", IM_COL32(200,160,50,220));
                 ImGui::Spacing();
                 if (ImGui::Button("Guardar PlaceId como Rivals", ImVec2(-1,0))) {
                     g_rivalsPlaceId = g_placeId;
@@ -2243,8 +2692,8 @@ int main() {
                     if (f) f << g_rivalsPlaceId;
                 }
 
-                ImGui::Spacing(); ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.50f,0.52f,0.65f,1.f), "Version: " CEITUS_VERSION);
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.45f,0.50f,0.65f,1.f), "Version: " CEITUS_VERSION);
 
                 if (g_updateAvailable && g_canUpdate) {
                     ImGui::Spacing();
@@ -2293,10 +2742,10 @@ int main() {
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("  Scripts  ")) {
+            if (ImGui::BeginTabItem(" Scripts ")) {
                 ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.5f,0.7f,1.f,1.f), "Inyector de DLL");
-                ImGui::Separator(); ImGui::Spacing();
+                SecHeader(dl, "INYECTOR DE DLL", IM_COL32(140,80,220,220));
+                ImGui::Spacing();
 
                 ImGui::Text("DLL:");
                 ImGui::SameLine();
@@ -2352,6 +2801,7 @@ int main() {
 
             ImGui::EndTabBar();
         }
+        ImGui::PopStyleColor(3); // tab colors
         ImGui::EndChild();
         ImGui::End();
 

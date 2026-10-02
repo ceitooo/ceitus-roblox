@@ -5,7 +5,7 @@
 /*                  skid v300
 /*                  https://discord.gg/r6vb93eEmq
 
-/*  Roblox Version  : version-2366ba214ec740ca
+/*  Roblox Version  : version-92289957c0e14590
 /*  Total Offsets   : 392
 */
 
@@ -14,7 +14,7 @@
 #include <string>
 
 namespace Offsets {
-    inline std::string ClientVersion = "version-2366ba214ec740ca";
+    inline std::string ClientVersion = "version-02c37bc51a384b8f";
 
     namespace Adornment {
         inline uintptr_t Adornee = 0xB8;
@@ -50,7 +50,7 @@ namespace Offsets {
     }
 
     namespace Attachment {
-        inline uintptr_t Position = 0xC4;
+        inline uintptr_t Position = 0xB4;
     }
 
     namespace Attribute {
@@ -93,15 +93,15 @@ namespace Offsets {
     }
 
     namespace BloomEffect {
-        inline uintptr_t Enabled = 0x30;
-        inline uintptr_t Intensity = 0xB8;
-        inline uintptr_t Size = 0xBC;
-        inline uintptr_t Threshold = 0xC0;
+        inline uintptr_t Enabled = 0xA0;
+        inline uintptr_t Intensity = 0xA8;
+        inline uintptr_t Size = 0xAC;
+        inline uintptr_t Threshold = 0xB0;
     }
 
     namespace BlurEffect {
-        inline uintptr_t Enabled = 0x30;
-        inline uintptr_t Size = 0xB8;
+        inline uintptr_t Enabled = 0xA0;
+        inline uintptr_t Size = 0xA8;
     }
 
     namespace ByteCode {
@@ -118,7 +118,7 @@ namespace Offsets {
         inline uintptr_t CameraSubject = 0xB8;
         inline uintptr_t CameraType = 0x128;
         inline uintptr_t FieldOfView = 0x130;
-        inline uintptr_t Position = 0xEC;
+        inline uintptr_t Position = 0xEC;   // Camera position (236 dec)
         inline uintptr_t Rotation = 0xC8;
         inline uintptr_t Viewport = 0x27C;
         inline uintptr_t ViewportInt16 = 0x27C;
@@ -126,10 +126,10 @@ namespace Offsets {
     }
 
     namespace CharacterMesh {
-        inline uintptr_t BaseTextureId = 0xC8;
-        inline uintptr_t BodyPart = 0x148;
-        inline uintptr_t MeshId = 0xF8;
-        inline uintptr_t OverlayTextureId = 0x128;
+        inline uintptr_t BaseTextureId = 0xB8;
+        inline uintptr_t BodyPart = 0x138;
+        inline uintptr_t MeshId = 0xE8;
+        inline uintptr_t OverlayTextureId = 0x118;
     }
 
     namespace Chat {
@@ -150,20 +150,20 @@ namespace Offsets {
     }
 
     namespace Clothing {
-        inline uintptr_t Color3 = 0x100;
-        inline uintptr_t Template = 0x100;
+        inline uintptr_t Color3 = 0x110;
+        inline uintptr_t Template = 0xF0;
     }
 
     namespace ColorCorrectionEffect {
-        inline uintptr_t Brightness = 0xC4;
-        inline uintptr_t Contrast = 0xC8;
-        inline uintptr_t Enabled = 0x30;
-        inline uintptr_t TintColor = 0xB0;
+        inline uintptr_t Brightness = 0xB4;
+        inline uintptr_t Contrast = 0xB8;
+        inline uintptr_t Enabled = 0xA0;
+        inline uintptr_t TintColor = 0xA8;
     }
 
     namespace ColorGradingEffect {
-        inline uintptr_t Enabled = 0x30;
-        inline uintptr_t TonemapperPreset = 0xB8;
+        inline uintptr_t Enabled = 0xA0;
+        inline uintptr_t TonemapperPreset = 0xA8;
     }
 
     namespace Creator {
@@ -185,11 +185,11 @@ namespace Offsets {
     }
 
     namespace DepthOfFieldEffect {
-        inline uintptr_t Enabled = 0x30;
-        inline uintptr_t FarIntensity = 0xB8;
-        inline uintptr_t FocusDistance = 0xBC;
-        inline uintptr_t InFocusRadius = 0xC0;
-        inline uintptr_t NearIntensity = 0xC4;
+        inline uintptr_t Enabled = 0xA0;
+        inline uintptr_t FarIntensity = 0xA8;
+        inline uintptr_t FocusDistance = 0xAC;
+        inline uintptr_t InFocusRadius = 0xB0;
+        inline uintptr_t NearIntensity = 0xB4;
     }
 
     namespace Descriptor {
@@ -206,7 +206,7 @@ namespace Offsets {
     }
 
     namespace FakeDataModel {
-        inline uintptr_t Pointer = 0x8EE1728;
+        inline uintptr_t Pointer = 0x8B54980;  // version-02c37bc51a384b8f
         inline uintptr_t RealDataModel = 0x1F8;
     }
 
@@ -379,7 +379,7 @@ namespace Offsets {
         inline uintptr_t AttributeToNext = 0x58;
         inline uintptr_t AttributeToValue = 0x18;
         inline uintptr_t ChildrenEnd = 0x8;
-        inline uintptr_t ChildrenStart = 0x78;
+        inline uintptr_t ChildrenStart = 0x78;  // 120
         inline uintptr_t ChildrenStride = 0x10;
         inline uintptr_t ClassByName = 0x46F6BFE;
         inline uintptr_t ClassDescriptor = 0x18;
@@ -389,7 +389,7 @@ namespace Offsets {
         inline uintptr_t Creator_isCreatable = 0x10;
         inline uintptr_t FromExisting = 0x417C6B0;
         inline uintptr_t Name = 0x8;
-        inline uintptr_t NameContainer = 0x70;
+        inline uintptr_t NameContainer = 0x70;  // 112
         inline uintptr_t New = 0x360A4D0;
         inline uintptr_t Parent = 0x68;
         inline uintptr_t SetParent = 0x7E4470;
@@ -553,15 +553,15 @@ namespace Offsets {
     }
 
     namespace MeshPart {
-        inline uintptr_t MeshId = 0x310;
-        inline uintptr_t Texture = 0x338;
-        inline uintptr_t TextureId = 0x340;
+        inline uintptr_t MeshId = 0x300;
+        inline uintptr_t Texture = 0x330;
+        inline uintptr_t TextureId = 0x330;
     }
 
     namespace Misc {
         inline uintptr_t StringLength = 0x10;
-        inline uintptr_t Value = 0xB8;
-        inline uintptr_t Adornee = 0xF0;
+        inline uintptr_t Value = 0xA8;
+        inline uintptr_t Adornee = 0xE0;
     }
 
     namespace Model {
@@ -579,9 +579,9 @@ namespace Offsets {
     }
 
     namespace MouseService {
-        inline uintptr_t InputObject = 0xF0;
-        inline uintptr_t InputObject2 = 0x100;
-        inline uintptr_t MousePosition = 0xD4;
+        inline uintptr_t InputObject = 0xE0;
+        inline uintptr_t InputObject2 = 0xF0;
+        inline uintptr_t MousePosition = 0xC4;
         inline uintptr_t SensitivityPointer = 0x0;
     }
 
@@ -650,13 +650,13 @@ namespace Offsets {
     }
 
     namespace ProximityPrompt {
-        inline uintptr_t ActionText = 0xB0;
-        inline uintptr_t Enabled = 0x136;
-        inline uintptr_t HoldDuration = 0x120;
-        inline uintptr_t KeyboardKeyCode = 0x124;
-        inline uintptr_t MaxActivationDistance = 0x128;
-        inline uintptr_t ObjectText = 0xD0;
-        inline uintptr_t RequiresLineOfSight = 0x137;
+        inline uintptr_t ActionText = 0xA0;
+        inline uintptr_t Enabled = 0x126;
+        inline uintptr_t HoldDuration = 0x110;
+        inline uintptr_t KeyboardKeyCode = 0x114;
+        inline uintptr_t MaxActivationDistance = 0x118;
+        inline uintptr_t ObjectText = 0xC0;
+        inline uintptr_t RequiresLineOfSight = 0x127;
     }
 
     namespace Reflection {
@@ -781,8 +781,8 @@ namespace Offsets {
         inline uintptr_t FakeDataModel = 0x38;
         inline uintptr_t FrameDt = 0xC0;
         inline uintptr_t FrameDtAlt = 0xB8;
-        inline uintptr_t RealDataModel = 0x1C8;
-        inline uintptr_t RenderView = 0x1D0;
+        inline uintptr_t RealDataModel = 0x1F0;
+        inline uintptr_t RenderView = 0x1D8;
     }
 
     namespace RenderQueue {
@@ -819,7 +819,7 @@ namespace Offsets {
     }
 
     namespace RunService {
-        inline uintptr_t HeartbeatFPS = 0xC0;
+        inline uintptr_t HeartbeatFPS = 0xC8;
         inline uintptr_t HeartbeatTask = 0xE0;
     }
 
@@ -839,7 +839,7 @@ namespace Offsets {
     }
 
     namespace Seat {
-        inline uintptr_t Occupant = 0x218;
+        inline uintptr_t Occupant = 0x208;
     }
 
     namespace Sky {
@@ -858,13 +858,13 @@ namespace Offsets {
     }
 
     namespace Sound {
-        inline uintptr_t IsPlaying = 0x140;
-        inline uintptr_t Looped = 0x13D;
-        inline uintptr_t PlaybackSpeed = 0x11C;
-        inline uintptr_t RollOffMaxDistance = 0x120;
-        inline uintptr_t RollOffMinDistance = 0x124;
-        inline uintptr_t SoundId = 0xC8;
-        inline uintptr_t Volume = 0x130;
+        inline uintptr_t IsPlaying = 0x130;
+        inline uintptr_t Looped = 0x12D;
+        inline uintptr_t PlaybackSpeed = 0x10C;
+        inline uintptr_t RollOffMaxDistance = 0x110;
+        inline uintptr_t RollOffMinDistance = 0x114;
+        inline uintptr_t SoundId = 0xB8;
+        inline uintptr_t Volume = 0x120;
     }
 
     namespace SpawnLocation {
@@ -873,16 +873,16 @@ namespace Offsets {
     }
 
     namespace SpecialMesh {
-        inline uintptr_t MeshId = 0xF8;
+        inline uintptr_t MeshId = 0xE8;
         inline uintptr_t Offset = 0xB8;
-        inline uintptr_t Scale = 0xC4;
+        inline uintptr_t Scale = 0xB4;
         inline uintptr_t TextureId = 0x128;
     }
 
     namespace SunRaysEffect {
-        inline uintptr_t Enabled = 0x30;
-        inline uintptr_t Intensity = 0xB8;
-        inline uintptr_t Spread = 0xBC;
+        inline uintptr_t Enabled = 0xA0;
+        inline uintptr_t Intensity = 0xA8;
+        inline uintptr_t Spread = 0xAC;
     }
 
     namespace SurfaceAppearance {
@@ -899,12 +899,12 @@ namespace Offsets {
         inline uintptr_t JobStart = 0xC8;
         inline uintptr_t MaxFPS = 0xB0;
         inline uintptr_t MaxFps = 0xB0;
-        inline uintptr_t Pointer = 0x8C8D108;
+        inline uintptr_t Pointer = 0x8AFF2A0;
     }
 
     namespace Team {
-        inline uintptr_t BrickColor = 0xB8;
-        inline uintptr_t TeamColor = 0xB8;
+        inline uintptr_t BrickColor = 0xA8;
+        inline uintptr_t TeamColor = 0xA8;
     }
 
     namespace TechniqueArray {
@@ -913,13 +913,13 @@ namespace Offsets {
     }
 
     namespace Terrain {
-        inline uintptr_t GrassLength = 0x1F0;
-        inline uintptr_t MaterialColors = 0x4B8;
-        inline uintptr_t WaterColor = 0x1E0;
-        inline uintptr_t WaterReflectance = 0x1F8;
-        inline uintptr_t WaterTransparency = 0x1FC;
-        inline uintptr_t WaterWaveSize = 0x200;
-        inline uintptr_t WaterWaveSpeed = 0x204;
+        inline uintptr_t GrassLength = 0x1E0;
+        inline uintptr_t MaterialColors = 0x4A8;
+        inline uintptr_t WaterColor = 0x1D0;
+        inline uintptr_t WaterReflectance = 0x1E8;
+        inline uintptr_t WaterTransparency = 0x1EC;
+        inline uintptr_t WaterWaveSize = 0x1F0;
+        inline uintptr_t WaterWaveSpeed = 0x1F4;
     }
 
     namespace TextButton {
@@ -968,21 +968,21 @@ namespace Offsets {
     }
 
     namespace Textures {
-        inline uintptr_t Decal_Texture = 0x1E0;
-        inline uintptr_t Texture_Texture = 0x1E0;
+        inline uintptr_t Decal_Texture = 0x1D0;
+        inline uintptr_t Texture_Texture = 0x1D0;
     }
 
     namespace Tool {
-        inline uintptr_t CanBeDropped = 0x4B8;
-        inline uintptr_t Enabled = 0x4B9;
-        inline uintptr_t Grip = 0x488;
-        inline uintptr_t GripForward = 0x4A0;
-        inline uintptr_t GripPos = 0x4AC;
-        inline uintptr_t GripRight = 0x488;
-        inline uintptr_t GripUp = 0x494;
-        inline uintptr_t ManualActivationOnly = 0x4BA;
-        inline uintptr_t RequiresHandle = 0x4BB;
-        inline uintptr_t Tooltip = 0x468;
+        inline uintptr_t CanBeDropped = 0x4A8;
+        inline uintptr_t Enabled = 0x4A9;
+        inline uintptr_t Grip = 0x49C;
+        inline uintptr_t GripForward = 0x490;
+        inline uintptr_t GripPos = 0x49C;
+        inline uintptr_t GripRight = 0x47C;
+        inline uintptr_t GripUp = 0x484;
+        inline uintptr_t ManualActivationOnly = 0x4AA;
+        inline uintptr_t RequiresHandle = 0x4AB;
+        inline uintptr_t Tooltip = 0x458;
     }
 
     namespace Types {
@@ -990,7 +990,7 @@ namespace Offsets {
     }
 
     namespace UserInputService {
-        inline uintptr_t WindowInputState = 0x2C0;
+        inline uintptr_t WindowInputState = 0x2B0;
     }
 
     namespace Value {
@@ -1009,19 +1009,19 @@ namespace Offsets {
     namespace VisualEngine {
         inline uintptr_t Dimensions = 0xB10;
         inline uintptr_t FakeDataModel = 0xAF0;
-        inline uintptr_t Pointer = 0x851BF08;
+        inline uintptr_t Pointer = 0x858D208;  // version-02c37bc51a384b8f
         inline uintptr_t RenderView = 0xC30;
         inline uintptr_t ViewMatrix = 0x1B0;
     }
 
     namespace Weld {
-        inline uintptr_t Part0 = 0x118;
-        inline uintptr_t Part1 = 0x128;
+        inline uintptr_t Part0 = 0x108;
+        inline uintptr_t Part1 = 0x118;
     }
 
     namespace WeldConstraint {
-        inline uintptr_t Part0 = 0xB8;
-        inline uintptr_t Part1 = 0xC8;
+        inline uintptr_t Part0 = 0xA8;
+        inline uintptr_t Part1 = 0xB8;
     }
 
     namespace WindowInputState {
@@ -1031,14 +1031,14 @@ namespace Offsets {
 
     namespace Workspace {
         inline uintptr_t CurrentCamera = 0x4A8;
-        inline uintptr_t ReadOnlyGravity = 0x9F0;
+        inline uintptr_t ReadOnlyGravity = 0x9B8;
         inline uintptr_t World = 0x400;
     }
 
     namespace World {
         inline uintptr_t AirProperties = 0x240;
         inline uintptr_t FallenPartsDestroyHeight = 0x208;
-        inline uintptr_t Gravity = 0x228;
+        inline uintptr_t Gravity = 0x22C;
         inline uintptr_t Primitives = 0x2B0;
         inline uintptr_t WorldSteps = 0x728;
         inline uintptr_t worldStepsPerSec = 0x708;
