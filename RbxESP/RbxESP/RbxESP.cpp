@@ -944,6 +944,54 @@ static void AimbotThread() {
     timeEndPeriod(1);
 }
 
+// Thread dedicado al fly/noclip a 4ms (250Hz) para ganarle a la física de Roblox (240Hz)
+static void FlyNoclipThread() {
+    timeBeginPeriod(1);
+    while (true) {
+        Sleep(4);
+        if (!mem.proc) continue;
+        uintptr_t lp = g_cachedLp;
+        if (!lp) continue;
+        uintptr_t lc = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
+        if (!lc || lc < 0x10000000000ULL) continue;
+
+        uintptr_t lh = FindFirstChild(lc, "Humanoid");
+        uintptr_t lhrp = lh ? mem.Read<uintptr_t>(lh + Offsets::Humanoid::HumanoidRootPart) : 0;
+        if (!lhrp) lhrp = FindFirstChild(lc, "HumanoidRootPart");
+        if (!lhrp) continue;
+        uintptr_t prim = mem.Read<uintptr_t>(lhrp + Offsets::BasePart::Primitive);
+        if (!prim || prim < 0x10000000000ULL) continue;
+
+        if (bFly) {
+            Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
+            if (GetAsyncKeyState(VK_SPACE) & 0x8000)       vel.y = fFlySpeed;
+            else if (GetAsyncKeyState(VK_LSHIFT) & 0x8000) vel.y = -fFlySpeed;
+            else                                             vel.y = 0.f;
+            mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
+        }
+
+        if (bNoclip) {
+            auto parts = GetChildren(lc);
+            for (uintptr_t part : parts) {
+                if (!part || part < 0x10000000000ULL) continue;
+                uintptr_t pp = mem.Read<uintptr_t>(part + Offsets::BasePart::Primitive);
+                if (!pp || pp < 0x10000000000ULL) continue;
+                uint16_t flags = mem.Read<uint16_t>(pp + Offsets::Primitive::Flags);
+                if (flags & (uint16_t)Offsets::PrimitiveFlags::CanCollide) {
+                    flags &= ~(uint16_t)Offsets::PrimitiveFlags::CanCollide;
+                    mem.Write(pp + Offsets::Primitive::Flags, flags);
+                }
+            }
+            // Cancelar rebote de depenetración
+            Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
+            if (fabsf(vel.x) > 30.f) vel.x = 0.f;
+            if (fabsf(vel.z) > 30.f) vel.z = 0.f;
+            mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
+        }
+    }
+    timeEndPeriod(1);
+}
+
 static void ESPScanThread() {
     const char* boneNames[] = {
         "Head","UpperTorso","LowerTorso","HumanoidRootPart",
@@ -994,57 +1042,6 @@ static void ESPScanThread() {
                             if (fabsf(cur - fJumpPower) > 0.5f)
                                 mem.Write(lh + Offsets::Humanoid::JumpPower, fJumpPower);
                         }
-                    }
-                }
-            }
-        }
-
-        // Noclip — borra CanCollide y cancela velocidad de rebote en HRP
-        if (bNoclip && lp) {
-            uintptr_t lc = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
-            if (lc) {
-                uintptr_t lh2 = FindFirstChild(lc, "Humanoid");
-                uintptr_t lhrp2 = lh2 ? mem.Read<uintptr_t>(lh2 + Offsets::Humanoid::HumanoidRootPart) : 0;
-                if (!lhrp2) lhrp2 = FindFirstChild(lc, "HumanoidRootPart");
-                auto parts = GetChildren(lc);
-                for (uintptr_t part : parts) {
-                    if (!part || part < 0x10000000000ULL) continue;
-                    uintptr_t prim = mem.Read<uintptr_t>(part + Offsets::BasePart::Primitive);
-                    if (!prim || prim < 0x10000000000ULL) continue;
-                    uint16_t flags = mem.Read<uint16_t>(prim + Offsets::Primitive::Flags);
-                    if (flags & (uint16_t)Offsets::PrimitiveFlags::CanCollide) {
-                        flags &= ~(uint16_t)Offsets::PrimitiveFlags::CanCollide;
-                        mem.Write(prim + Offsets::Primitive::Flags, flags);
-                    }
-                }
-                // Cancelar impulsos de depenetración (el "me envía para atrás")
-                if (lhrp2) {
-                    uintptr_t hrpPrim = mem.Read<uintptr_t>(lhrp2 + Offsets::BasePart::Primitive);
-                    if (hrpPrim) {
-                        Vector3 vel = mem.Read<Vector3>(hrpPrim + Offsets::Primitive::AssemblyLinearVelocity);
-                        if (fabsf(vel.x) > 30.f) vel.x = 0.f;
-                        if (fabsf(vel.z) > 30.f) vel.z = 0.f;
-                        mem.Write(hrpPrim + Offsets::Primitive::AssemblyLinearVelocity, vel);
-                    }
-                }
-            }
-        }
-
-        // Fly — escribe AssemblyLinearVelocity.y en HRP (Space=subir, Shift=bajar)
-        if (bFly && lp) {
-            uintptr_t lc = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
-            if (lc) {
-                uintptr_t lh2 = FindFirstChild(lc, "Humanoid");
-                uintptr_t lhrp2 = lh2 ? mem.Read<uintptr_t>(lh2 + Offsets::Humanoid::HumanoidRootPart) : 0;
-                if (!lhrp2) lhrp2 = FindFirstChild(lc, "HumanoidRootPart");
-                if (lhrp2) {
-                    uintptr_t prim = mem.Read<uintptr_t>(lhrp2 + Offsets::BasePart::Primitive);
-                    if (prim) {
-                        Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
-                        if (GetAsyncKeyState(VK_SPACE) & 0x8000) vel.y = fFlySpeed;
-                        else if ((GetAsyncKeyState(VK_LSHIFT) | GetAsyncKeyState(VK_RSHIFT)) & 0x8000) vel.y = -fFlySpeed;
-                        else vel.y = 0.f;
-                        mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
                     }
                 }
             }
@@ -2299,6 +2296,7 @@ int main() {
                         StartOffsetUpdater(L"roblox");
                         std::thread(VMReaderThread).detach();
                         std::thread(AimbotThread).detach();
+                        std::thread(FlyNoclipThread).detach();
                         std::thread(ESPScanThread).detach();
                     }
                     // seguir buscando la ventana en segundo plano para el overlay
@@ -2426,6 +2424,7 @@ int main() {
                                     StartOffsetUpdater(L"roblox");
                                     std::thread(VMReaderThread).detach();
                                     std::thread(AimbotThread).detach();
+                                    std::thread(FlyNoclipThread).detach();
                                     std::thread(ESPScanThread).detach();
                                 }
                                 std::thread([](){
