@@ -300,6 +300,8 @@ bool  bUserFilter = false;
 bool  bThirdPerson = false;
 // nuevas características
 bool  bNoclip          = false;
+bool  bFly             = false;
+float fFlySpeed        = 20.f;
 bool  bWalkSpeed       = false;
 float fWalkSpeed       = 16.f;
 bool  bJumpPower       = false;
@@ -997,10 +999,13 @@ static void ESPScanThread() {
             }
         }
 
-        // Noclip — borra el bit CanCollide del Primitive de cada parte del personaje local
+        // Noclip — borra CanCollide y cancela velocidad de rebote en HRP
         if (bNoclip && lp) {
             uintptr_t lc = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
             if (lc) {
+                uintptr_t lh2 = FindFirstChild(lc, "Humanoid");
+                uintptr_t lhrp2 = lh2 ? mem.Read<uintptr_t>(lh2 + Offsets::Humanoid::HumanoidRootPart) : 0;
+                if (!lhrp2) lhrp2 = FindFirstChild(lc, "HumanoidRootPart");
                 auto parts = GetChildren(lc);
                 for (uintptr_t part : parts) {
                     if (!part || part < 0x10000000000ULL) continue;
@@ -1010,6 +1015,36 @@ static void ESPScanThread() {
                     if (flags & (uint16_t)Offsets::PrimitiveFlags::CanCollide) {
                         flags &= ~(uint16_t)Offsets::PrimitiveFlags::CanCollide;
                         mem.Write(prim + Offsets::Primitive::Flags, flags);
+                    }
+                }
+                // Cancelar impulsos de depenetración (el "me envía para atrás")
+                if (lhrp2) {
+                    uintptr_t hrpPrim = mem.Read<uintptr_t>(lhrp2 + Offsets::BasePart::Primitive);
+                    if (hrpPrim) {
+                        Vector3 vel = mem.Read<Vector3>(hrpPrim + Offsets::Primitive::AssemblyLinearVelocity);
+                        if (fabsf(vel.x) > 30.f) vel.x = 0.f;
+                        if (fabsf(vel.z) > 30.f) vel.z = 0.f;
+                        mem.Write(hrpPrim + Offsets::Primitive::AssemblyLinearVelocity, vel);
+                    }
+                }
+            }
+        }
+
+        // Fly — escribe AssemblyLinearVelocity.y en HRP (Space=subir, Shift=bajar)
+        if (bFly && lp) {
+            uintptr_t lc = mem.Read<uintptr_t>(lp + Offsets::Player::ModelInstance);
+            if (lc) {
+                uintptr_t lh2 = FindFirstChild(lc, "Humanoid");
+                uintptr_t lhrp2 = lh2 ? mem.Read<uintptr_t>(lh2 + Offsets::Humanoid::HumanoidRootPart) : 0;
+                if (!lhrp2) lhrp2 = FindFirstChild(lc, "HumanoidRootPart");
+                if (lhrp2) {
+                    uintptr_t prim = mem.Read<uintptr_t>(lhrp2 + Offsets::BasePart::Primitive);
+                    if (prim) {
+                        Vector3 vel = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
+                        if (GetAsyncKeyState(VK_SPACE) & 0x8000) vel.y = fFlySpeed;
+                        else if ((GetAsyncKeyState(VK_LSHIFT) | GetAsyncKeyState(VK_RSHIFT)) & 0x8000) vel.y = -fFlySpeed;
+                        else vel.y = 0.f;
+                        mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
                     }
                 }
             }
@@ -1352,7 +1387,8 @@ static void SaveConfig(int mode = -1) {
       << bNoRecoil    << "\n" << fNoRecoilStr << "\n"
       << bSilentAim   << "\n" << bSpectatorList << "\n"
       << bChatESP    << "\n"
-      << bNoclip     << "\n";
+      << bNoclip     << "\n"
+      << bFly        << "\n" << fFlySpeed << "\n";
 }
 
 static void LoadConfig(int mode = -1) {
@@ -1409,6 +1445,9 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) f >> bSpectatorList;
     if (!f.eof()) f >> bChatESP;
     if (!f.eof()) f >> bNoclip;
+    if (!f.eof()) f >> bFly;
+    if (!f.eof()) f >> fFlySpeed;
+    if (fFlySpeed < 5.f || fFlySpeed > 100.f) fFlySpeed = 20.f;
     // clamp para evitar valores absurdos de configs viejas
     if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
     if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
@@ -1460,7 +1499,7 @@ int main() {
     }
     LoadConfig();
     // opciones que escriben en memoria del juego: siempre empiezan desactivadas
-    bWalkSpeed = false; bJumpPower = false; bGravity = false; bNoclip = false;
+    bWalkSpeed = false; bJumpPower = false; bGravity = false; bNoclip = false; bFly = false;
     bThirdPerson = false; bSilentAim = false; bNoRecoil = false;
     bAntiFlash = false; bAntiSmoke = false;
     { std::ifstream f("ceitus_rivals_placeid.cfg"); if (f) f >> g_rivalsPlaceId; }
@@ -1558,16 +1597,30 @@ int main() {
             }
             lastPanicKey = curPanic;
         }
-        // anti-AFK: micro-movimiento de mouse cada 55s (funciona en segundo plano, sin foco)
+        // anti-AFK: escribe micro-velocidad en HRP (funciona sin foco, el servidor ve movimiento)
         if (bAntiAFK) {
             static DWORD lastAfk = 0;
+            static int afkPhase = 0;
             DWORD nowAfk = GetTickCount();
             if (nowAfk - lastAfk > 55000) {
                 lastAfk = nowAfk;
-                INPUT inp[2]{};
-                inp[0].type = INPUT_MOUSE; inp[0].mi.dwFlags = MOUSEEVENTF_MOVE; inp[0].mi.dx = 1;  inp[0].mi.dy = 0;
-                inp[1].type = INPUT_MOUSE; inp[1].mi.dwFlags = MOUSEEVENTF_MOVE; inp[1].mi.dx = -1; inp[1].mi.dy = 0;
-                SendInput(2, inp, sizeof(INPUT));
+                uintptr_t glp = g_cachedLp;
+                if (glp) {
+                    uintptr_t lc = mem.Read<uintptr_t>(glp + Offsets::Player::ModelInstance);
+                    if (lc) {
+                        uintptr_t lh2 = FindFirstChild(lc, "Humanoid");
+                        uintptr_t lhrp2 = lh2 ? mem.Read<uintptr_t>(lh2 + Offsets::Humanoid::HumanoidRootPart) : 0;
+                        if (!lhrp2) lhrp2 = FindFirstChild(lc, "HumanoidRootPart");
+                        if (lhrp2) {
+                            uintptr_t prim = mem.Read<uintptr_t>(lhrp2 + Offsets::BasePart::Primitive);
+                            if (prim) {
+                                float vx = (afkPhase++ % 2 == 0) ? 1.f : -1.f;
+                                Vector3 jiggle{vx, 0.f, 0.f};
+                                mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, jiggle);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2604,6 +2657,13 @@ int main() {
                     ImGui::Unindent(12.f);
                 }
                 ImGui::Checkbox("Noclip", &bNoclip);
+                ImGui::Checkbox("Fly [Space=subir / Shift=bajar]", &bFly);
+                if (bFly) {
+                    ImGui::Indent(12.f);
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderFloat("Velocidad vuelo##fly", &fFlySpeed, 5.f, 100.f, "%.0f");
+                    ImGui::Unindent(12.f);
+                }
                 ImGui::Spacing();
                 SecHeader(dl, "ARMAS", IM_COL32(220,80,120,220));
                 ImGui::BeginTable("##wpnopts", 2, ImGuiTableFlags_None, {0, 0});
