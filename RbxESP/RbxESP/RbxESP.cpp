@@ -446,6 +446,7 @@ ViewMatrix_t lastVm{};
 uintptr_t    lastPs = 0;
 uintptr_t    g_cachedAimTarget = 0; // target actual del aimbot (para FOV dinámico)
 uintptr_t    g_cachedAimChar   = 0; // character del target (para snap indicator en overlay)
+Vector3      g_cachedAimHeadW  = {}; // posición world de la cabeza del target (para snap indicator)
 bool         bShowFov          = true; // mostrar círculo FOV independientemente del aimbot
 
 // radar: lista de entradas para dibujar (llenada en ESP loop, leída en render)
@@ -670,7 +671,7 @@ static void AimbotThread() {
         } else { lastHumState = 0; }
 
         if (!bAimbot && !bTriggerbot) {
-            hasSmooth = false; cachedPlayer = 0; g_cachedAimTarget = 0; g_cachedAimChar = 0; continue;
+            hasSmooth = false; cachedPlayer = 0; g_cachedAimTarget = 0; g_cachedAimChar = 0; g_cachedAimHeadW = {}; continue;
         }
 
         float sw = (float)g_width, sh = (float)g_height;
@@ -834,6 +835,7 @@ static void AimbotThread() {
             else continue;
         }
         if (fabsf(headW.y) > 1000000.f) continue;
+        g_cachedAimHeadW = headW; // para snap indicator del FOV
 
         // ---- predicción de movimiento ----
         if (lastHeadTime && now > lastHeadTime) {
@@ -2008,18 +2010,14 @@ int main() {
             bool locked = (g_cachedAimTarget != 0);
             COLORREF fovCol = locked ? RGB(0,220,80) : (bAimbot ? RGB(200,200,200) : RGB(120,120,120));
             DrawEllipse({fcx, fcy}, fAimFov, fAimFov, fovCol);
-            if (locked && g_cachedAimChar) {
-                uintptr_t ac = g_cachedAimChar;
-                std::vector<CachedPlayerESP> fovSnap;
-                { std::lock_guard<std::mutex> lk(g_espMtx); fovSnap = g_espCache; }
-                for (auto& ce : fovSnap) {
-                    if (ce.character != ac) continue;
+            if (locked) {
+                Vector3 hw = g_cachedAimHeadW;
+                if (fabsf(hw.x) + fabsf(hw.y) + fabsf(hw.z) > 0.01f) {
                     Vector2 hss;
-                    if (WorldToScreen(vmF, ce.headPos, hss, fswF, fshF)) {
-                        DrawEllipse({hss.x, hss.y}, 12.f, 12.f, RGB(0,255,80));
+                    if (WorldToScreen(vmF, hw, hss, fswF, fshF)) {
+                        DrawEllipse({hss.x, hss.y}, 8.f, 8.f, RGB(0,255,80));
                         DrawLine({fcx, fcy}, {hss.x, hss.y}, RGB(0,200,60), 1);
                     }
-                    break;
                 }
             }
         }
