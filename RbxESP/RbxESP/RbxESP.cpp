@@ -280,7 +280,7 @@ bool bTriggerbot = false;
 bool bRadar      = false;
 bool bPrediction = false;
 float fAimFov      = 80.f;
-float fAimSmooth   = 60.f;
+float fAimSmooth   = 40.f;
 float fTriggerFov  = 8.f;   // px radius para triggerbot
 float fRadarRange  = 150.f; // studs en el radar
 float fPrediction  = 0.08f; // segundos de predicción
@@ -883,8 +883,8 @@ static void AimbotThread() {
             // skipNext: evita acumular doble movimiento antes de que Roblox actualice la cámara
             if (skipNext) { skipNext = false; continue; }
 
-            // /300: 30% ≈ velocidad original, 60% = 2x más rápido, 100% = snap
-            float gain = std::clamp(fAimSmooth / 300.f, 0.005f, 0.35f);
+            // 60% = ~80ms para 100px, 100% = snap instantáneo
+            float gain = std::clamp(fAimSmooth / 100.f, 0.005f, 1.0f);
 
             // nunca mover más que la distancia restante (sin overshoot)
             float moveX = dx * gain;
