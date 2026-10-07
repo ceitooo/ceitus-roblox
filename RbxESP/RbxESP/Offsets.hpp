@@ -1,12 +1,5 @@
-﻿/*                          jingohok
-/*                  best dumper? you need
-/*                  contact me not jonah
-/*                  jonah is a loser im boss
-/*                  skid v300
-/*                  https://discord.gg/r6vb93eEmq
-
-/*  Roblox Version  : version-92289957c0e14590
-/*  Total Offsets   : 392
+﻿/*  Roblox Version  : version-cec3ad5889b447cf
+/*  Updated At      : 07/10/2026
 */
 
 #pragma once
@@ -14,7 +7,7 @@
 #include <string>
 
 namespace Offsets {
-    inline std::string ClientVersion = "version-02c37bc51a384b8f";
+    inline std::string ClientVersion = "version-cec3ad5889b447cf";
 
     namespace Adornment {
         inline uintptr_t Adornee = 0xB8;
@@ -120,9 +113,10 @@ namespace Offsets {
         inline uintptr_t FieldOfView = 0x130;
         inline uintptr_t Position = 0xEC;   // Camera position (236 dec)
         inline uintptr_t Rotation = 0xC8;
-        inline uintptr_t Viewport = 0x27C;
-        inline uintptr_t ViewportInt16 = 0x27C;
-        inline uintptr_t ViewportSize = 0x2BC;
+        inline uintptr_t Viewport = 0x28C;
+        inline uintptr_t ViewportInt16 = 0x28C;
+        inline uintptr_t ViewportSize = 0x2CC;
+        inline uintptr_t ImagePlaneDepth = 0x2D4;
     }
 
     namespace CharacterMesh {
@@ -206,7 +200,7 @@ namespace Offsets {
     }
 
     namespace FakeDataModel {
-        inline uintptr_t Pointer = 0x8B54980;  // version-02c37bc51a384b8f
+        inline uintptr_t Pointer = 0x8bcfd50;  // version-cec3ad5889b447cf
         inline uintptr_t RealDataModel = 0x1F8;
     }
 
@@ -336,10 +330,10 @@ namespace Offsets {
         inline uintptr_t HealthDisplayDistance = 0x178;
         inline uintptr_t HealthDisplayType = 0x17C;
         inline uintptr_t HipHeight = 0x184;
-        inline uintptr_t HumanoidRootPart = 0x458;
-        inline uintptr_t HumanoidState = 0x8A0;
+        inline uintptr_t HumanoidRootPart = 0x460;
+        inline uintptr_t HumanoidState = 0x8A8;
         inline uintptr_t HumanoidStateID = 0x20;
-        inline uintptr_t IsWalking = 0xA1F;
+        inline uintptr_t IsWalking = 0xA27;
         inline uintptr_t Jump = 0x1CA;
         inline uintptr_t JumpHeight = 0x190;
         inline uintptr_t JumpPower = 0x194;
@@ -819,8 +813,8 @@ namespace Offsets {
     }
 
     namespace RunService {
-        inline uintptr_t HeartbeatFPS = 0xC8;
-        inline uintptr_t HeartbeatTask = 0xE0;
+        inline uintptr_t HeartbeatFPS = 0xE1;
+        inline uintptr_t HeartbeatTask = 0x6338;
     }
 
     namespace Script {
@@ -899,7 +893,7 @@ namespace Offsets {
         inline uintptr_t JobStart = 0xC8;
         inline uintptr_t MaxFPS = 0xB0;
         inline uintptr_t MaxFps = 0xB0;
-        inline uintptr_t Pointer = 0x8AFF2A0;
+        inline uintptr_t Pointer = 0x8b79128;
     }
 
     namespace Team {
@@ -1009,7 +1003,7 @@ namespace Offsets {
     namespace VisualEngine {
         inline uintptr_t Dimensions = 0xB10;
         inline uintptr_t FakeDataModel = 0xAF0;
-        inline uintptr_t Pointer = 0x858D208;  // version-02c37bc51a384b8f
+        inline uintptr_t Pointer = 0x8656e40;  // version-cec3ad5889b447cf
         inline uintptr_t RenderView = 0xC30;
         inline uintptr_t ViewMatrix = 0x1B0;
     }
@@ -1031,17 +1025,17 @@ namespace Offsets {
 
     namespace Workspace {
         inline uintptr_t CurrentCamera = 0x4A8;
-        inline uintptr_t ReadOnlyGravity = 0x9B8;
+        inline uintptr_t DistributedGameTime = 0x4C8;
+        inline uintptr_t ReadOnlyGravity = 0x9C8;
         inline uintptr_t World = 0x400;
     }
 
     namespace World {
-        inline uintptr_t AirProperties = 0x240;
-        inline uintptr_t FallenPartsDestroyHeight = 0x208;
-        inline uintptr_t Gravity = 0x22C;
-        inline uintptr_t Primitives = 0x2B0;
-        inline uintptr_t WorldSteps = 0x728;
-        inline uintptr_t worldStepsPerSec = 0x708;
+        inline uintptr_t AirProperties = 0x238;
+        inline uintptr_t FallenPartsDestroyHeight = 0x218;
+        inline uintptr_t Gravity = 0x224;
+        inline uintptr_t Primitives = 0x2C8;
+        inline uintptr_t worldStepsPerSec = 0x740;
     }
 
     namespace WorldRoot {
