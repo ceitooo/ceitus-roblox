@@ -1861,11 +1861,11 @@ int main() {
                             float pct = std::clamp(ce.health / maxHp, 0.f, 1.f);
                             DrawHealthBar(tl, visH, pct);
                         }
-                        if (bSnaplines && feetFront && OnScreen(feetSc, sw, sh))
-                            DrawLine({ sw * 0.5f, sh }, feetSc, ce.col);
                     } else {
                         DrawDot({ midX, (topY + bottomY) * 0.5f }, 3, ce.col);
                     }
+                    if (bSnaplines && feetFront && OnScreen(feetSc, sw, sh))
+                        DrawLine({ sw * 0.5f, sh }, feetSc, ce.col);
                     if (bChatESP && ce.hasChat) {
                         std::string chatLabel = ce.chatMsg.empty() ? "..." : ce.chatMsg;
                         if (chatLabel.size() > 30) chatLabel = chatLabel.substr(0, 30) + "..";
@@ -2005,6 +2005,7 @@ int main() {
             float fswF = (float)g_width, fshF = (float)g_height;
             ViewMatrix_t vmF = lastVm;
             POINT cur; GetCursorPos(&cur);
+            ScreenToClient(g_overlay, &cur);
             float fcx = (float)cur.x, fcy = (float)cur.y;
             if (fcx < 0 || fcx > fswF || fcy < 0 || fcy > fshF) { fcx = fswF*0.5f; fcy = fshF*0.5f; }
             bool locked = (g_cachedAimTarget != 0);
@@ -2357,7 +2358,7 @@ int main() {
                         std::this_thread::sleep_for(std::chrono::seconds(2));
                     // hilos arrancan tan pronto como attach ok (no esperan la ventana)
                     if (!g_threadsStarted.exchange(true)) {
-                        StartOffsetUpdater(L"roblox");
+                        // StartOffsetUpdater deshabilitado — offsets hardcodeados en Offsets.hpp
                         std::thread(VMReaderThread).detach();
                         std::thread(AimbotThread).detach();
                         std::thread(FlyNoclipThread).detach();
@@ -2485,7 +2486,7 @@ int main() {
                         std::thread([](){
                             if (mem.Attach(L"RobloxPlayerBeta.exe")) {
                                 if (!g_threadsStarted.exchange(true)) {
-                                    StartOffsetUpdater(L"roblox");
+                                    // StartOffsetUpdater deshabilitado — offsets hardcodeados en Offsets.hpp
                                     std::thread(VMReaderThread).detach();
                                     std::thread(AimbotThread).detach();
                                     std::thread(FlyNoclipThread).detach();
