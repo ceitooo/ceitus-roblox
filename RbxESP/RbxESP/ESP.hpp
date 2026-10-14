@@ -49,11 +49,28 @@ inline uintptr_t FindFirstDescendant(uintptr_t inst, const char* name, int depth
     return 0;
 }
 
-// ---- DataModel (cadena directa con FakeDataModel::Pointer) ----
+// ---- DataModel ----
 inline uintptr_t GetDataModel() {
+    // Camino 1: FakeDataModel::Pointer (RVA estático)
     uintptr_t fdm = mem.Read<uintptr_t>(mem.base + Offsets::FakeDataModel::Pointer);
-    if (!fdm) return 0;
-    return mem.Read<uintptr_t>(fdm + Offsets::FakeDataModel::RealDataModel);
+    if (fdm) {
+        uintptr_t dm = mem.Read<uintptr_t>(fdm + Offsets::FakeDataModel::RealDataModel);
+        if (dm) return dm;
+    }
+
+    // Camino 2: VisualEngine → FakeDataModel (fallback si el puntero estático falló)
+    if (Offsets::VisualEngine::Pointer) {
+        uintptr_t ve = mem.Read<uintptr_t>(mem.base + Offsets::VisualEngine::Pointer);
+        if (ve) {
+            uintptr_t fdm2 = mem.Read<uintptr_t>(ve + Offsets::VisualEngine::FakeDataModel);
+            if (fdm2) {
+                uintptr_t dm = mem.Read<uintptr_t>(fdm2 + Offsets::FakeDataModel::RealDataModel);
+                if (dm) return dm;
+            }
+        }
+    }
+
+    return 0;
 }
 
 // ---- ViewProjection matrix ----

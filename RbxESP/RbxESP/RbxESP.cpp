@@ -284,7 +284,7 @@ float fAimSmooth   = 40.f;
 float fTriggerFov  = 8.f;   // px radius para triggerbot
 float fRadarRange  = 150.f; // studs en el radar
 float fPrediction  = 0.08f; // segundos de predicción
-float fAimMaxDist       = 200.f; // distancia máxima en studs para aimbot
+float fAimMaxDist       = 10000000.f; // distancia máxima en studs (10M = sin límite práctico)
 bool  bAimbotTeamFilter = false;
 bool  bAimbotNoFov = false;
 int   iAimBone = 0; // 0=Cabeza, 1=Cuello, 2=Pecho
@@ -377,11 +377,12 @@ static std::mutex g_healthMtx;
 // ---- cache ESP: ESPScanThread actualiza, render solo lee snapshot ----
 struct CachedPlayerESP {
     Vector3     pos, headPos, feetPos;
+    Vector3     prevPos;
     Vector3     bones[21];
     Vector3     bonesPrev[21];
     bool        boneOk[21];
     uintptr_t   bonePtrs[21];
-    uintptr_t   bonePrims[21]; // cached Primitive pointers — rarely change
+    uintptr_t   bonePrims[21];
     float       health, maxHealth;
     std::string name;
     COLORREF    col;
@@ -389,6 +390,7 @@ struct CachedPlayerESP {
     uintptr_t   hrp;
     uintptr_t   humanoid;
     DWORD       boneUpdateTime;
+    DWORD       lastPosChange;
     Vector3     velocity;
     bool        hasChat;
     std::string chatMsg;
@@ -759,6 +761,17 @@ static void AimbotThread() {
                     }
 
                     uintptr_t chr = mem.Read<uintptr_t>(player + Offsets::Player::ModelInstance);
+                    if (!chr || chr < 0x10000000000ULL) {
+                        // Fallback (mismo que ESP): buscar personaje en Workspace por nombre
+                        std::string pname = GetInstanceName(player);
+                        if (!pname.empty()) {
+                            uintptr_t ws = FindFirstChild(dm, "Workspace");
+                            if (ws) {
+                                uintptr_t cInWs = FindFirstChild(ws, pname.c_str());
+                                if (cInWs && cInWs > 0x10000000000ULL) chr = cInWs;
+                            }
+                        }
+                    }
                     if (!chr) continue;
                     // no re-adquirir al mismo JUGADOR durante 1.5 segundos tras su muerte
                     if (player == lastDeadPlayer && (GetTickCount() - lastDeadTime) < 1500) continue;
@@ -993,9 +1006,56 @@ static void FlyNoclipThread() {
                 // lerp suave: 30% del camino cada 4ms → natural sin saltos
                 s_curVelY += (targetY - s_curVelY) * 0.30f;
 
+                // ---- fly horizontal: WASD en la dirección de la cámara ----
+                // Lee rotación de la cámara, proyecta forward/right al plano horizontal.
+                float wishX = 0.f, wishZ = 0.f;
+                bool w = (GetAsyncKeyState('W') & 0x8000) != 0;
+                bool s = (GetAsyncKeyState('S') & 0x8000) != 0;
+                bool a = (GetAsyncKeyState('A') & 0x8000) != 0;
+                bool d = (GetAsyncKeyState('D') & 0x8000) != 0;
+                bool anyWasd = (w||s||a||d);
+                // ignorar WASD si el panel/overlay tiene foco de texto (evita que escribir mueva al pj)
+                HWND fg = GetForegroundWindow();
+                if (fg && fg != g_rbxWnd) anyWasd = false;
+
+                if (anyWasd) {
+                    uintptr_t dmF = GetDataModel();
+                    if (dmF) {
+                        uintptr_t wsF = mem.Read<uintptr_t>(dmF + Offsets::DataModel::Workspace);
+                        if (!wsF) wsF = FindFirstChild(dmF, "Workspace");
+                        if (wsF) {
+                            uintptr_t camF = mem.Read<uintptr_t>(wsF + Offsets::Workspace::CurrentCamera);
+                            if (camF) {
+                                // CFrame layout: 3x3 rot matrix a Camera::CFrame; col 2 = look dir
+                                float R[9]{};
+                                ReadProcessMemory(mem.proc, (LPCVOID)(camF + Offsets::Camera::CFrame), R, 36, nullptr);
+                                // Roblox: forward = -look = -(R[2], R[5], R[8])
+                                float fwdX = -R[2], fwdZ = -R[8];
+                                float rgtX =  R[0], rgtZ =  R[6];
+                                // normalizar al plano horizontal
+                                float fL = sqrtf(fwdX*fwdX + fwdZ*fwdZ);
+                                float rL = sqrtf(rgtX*rgtX + rgtZ*rgtZ);
+                                if (fL > 0.001f) { fwdX/=fL; fwdZ/=fL; }
+                                if (rL > 0.001f) { rgtX/=rL; rgtZ/=rL; }
+                                if (w) { wishX += fwdX; wishZ += fwdZ; }
+                                if (s) { wishX -= fwdX; wishZ -= fwdZ; }
+                                if (d) { wishX += rgtX; wishZ += rgtZ; }
+                                if (a) { wishX -= rgtX; wishZ -= rgtZ; }
+                                float wL = sqrtf(wishX*wishX + wishZ*wishZ);
+                                if (wL > 0.001f) { wishX /= wL; wishZ /= wL; }
+                            }
+                        }
+                    }
+                }
+
                 // 1) velocidad (juegos con physics ownership del cliente)
                 vel.y = s_curVelY;
+                vel.x = wishX * fFlySpeed;
+                vel.z = wishZ * fFlySpeed;
                 mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
+                // posición directa horizontal también (para servers que ignoran velocity)
+                pos.x += vel.x * 0.004f;
+                pos.z += vel.z * 0.004f;
 
                 // 2) posición directa (juegos con BodyVelocity u override del server)
                 //    cuando s_curVelY=0 (hover) ancla la Y contra gravity/constraints
@@ -1021,6 +1081,21 @@ static void FlyNoclipThread() {
             if (fabsf(vel.x) > 30.f) vel.x = 0.f;
             if (fabsf(vel.z) > 30.f) vel.z = 0.f;
             mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vel);
+        }
+
+        // ---- walkspeed bypass: normaliza velocidad horizontal al target ----
+        // NO multiplica (eso compoundea a 250Hz y te manda al espacio).
+        // Setea magnitud = fWalkSpeed en la dirección actual del player.
+        if (bWalkSpeed && !bFly && fWalkSpeed > 16.5f) {
+            Vector3 vw = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
+            float hLen2 = vw.x*vw.x + vw.z*vw.z;
+            if (hLen2 > 4.f) { // >2 studs/s = el player está empujando WASD
+                float hLen = sqrtf(hLen2);
+                float factor = fWalkSpeed / hLen;
+                vw.x *= factor;
+                vw.z *= factor;
+                mem.Write(prim + Offsets::Primitive::AssemblyLinearVelocity, vw);
+            }
         }
     }
     timeEndPeriod(1);
@@ -1119,13 +1194,29 @@ static void ESPScanThread() {
             }
         }
 
+        static DWORD lastScanDbg = 0;
+        bool doScanDbg = (now - lastScanDbg > 2000);
+        if (doScanDbg) lastScanDbg = now;
+        int dbgTotal = 0, dbgInvalid = 0, dbgTeamSkip = 0, dbgRecovered = 0;
+
+        std::vector<std::string> failedNames;
+
         for (uintptr_t player : allP) {
             if (player == lp) continue;
+            dbgTotal++;
             PlayerInfo pi = ReadPlayer(player);
-            if (!pi.valid || fabsf(pi.pos.y) > 1000000.f) continue;
+
+            if (!pi.valid) {
+                if (!pi.name.empty()) failedNames.push_back(pi.name);
+                // No reciclar posición vieja: produce "antenas" cuando Roblox deja de
+                // streamear la física del jugador remoto. Si no se puede leer ahora, no dibujar.
+                dbgInvalid++;
+                continue;
+            }
+            if (fabsf(pi.pos.y) > 1000000.f) continue;
             uintptr_t pTeam = mem.Read<uintptr_t>(player + Offsets::Player::Team);
             bool isTeammate = (localTeam > 0x10000000000ULL && pTeam > 0x10000000000ULL && pTeam == localTeam);
-            if (bTeamFilter && multiTeam && isTeammate) continue;
+            if (bTeamFilter && multiTeam && isTeammate) { dbgTeamSkip++; continue; }
 
             if (bUserFilter && !g_targetUsers.empty()) {
                 bool found = false;
@@ -1150,14 +1241,39 @@ static void ESPScanThread() {
             ce.hrp       = pi.hrp;
             ce.humanoid  = pi.humanoid;
 
-            // velocidad del HRP
-            if (bVelocityESP && pi.hrp) {
+            // siempre leer velocidad para predicción de posición
+            if (pi.hrp) {
                 uintptr_t prim = mem.Read<uintptr_t>(pi.hrp + Offsets::BasePart::Primitive);
                 if (prim) ce.velocity = mem.Read<Vector3>(prim + Offsets::Primitive::AssemblyLinearVelocity);
             }
 
-            // chat bubble: detectar BillboardGui en la Head del personaje
-            if (bChatESP && pi.character) {
+            // detectar si la posición cambió respecto al scan anterior
+            ce.lastPosChange = now;
+            for (auto& old : oldSnap) {
+                if (old.character == ce.character) {
+                    float dx = ce.pos.x - old.pos.x, dy = ce.pos.y - old.pos.y, dz = ce.pos.z - old.pos.z;
+                    if (dx*dx + dy*dy + dz*dz < 0.01f) {
+                        ce.lastPosChange = old.lastPosChange;
+                        ce.velocity = old.velocity;
+                    }
+                    ce.prevPos = old.pos;
+                    break;
+                }
+            }
+
+            // chat bubble: detectar BillboardGui en la Head del personaje (throttled)
+            static DWORD lastChatScan = 0;
+            DWORD nowChat = GetTickCount();
+            bool doChatScan = bChatESP && (nowChat - lastChatScan > 500);
+            if (doChatScan) lastChatScan = nowChat;
+            if (!doChatScan && bChatESP) {
+                for (auto& old : oldSnap) {
+                    if (old.character == ce.character) {
+                        ce.hasChat = old.hasChat; ce.chatMsg = old.chatMsg; break;
+                    }
+                }
+            }
+            if (doChatScan && pi.character) {
                 uintptr_t head = FindFirstChild(pi.character, "Head");
                 if (head) {
                     for (uintptr_t hc : GetChildren(head)) {
@@ -1201,7 +1317,10 @@ static void ESPScanThread() {
                 col = tp[idx];
                 if (isTeammate) col = RGB(std::min(255,(int)GetRValue(col)+80),std::min(255,(int)GetGValue(col)+80),std::min(255,(int)GetBValue(col)+80));
             } else if (isTeammate) { col = RGB(50,150,255); } else { col = RGB(50,220,50); }
-            ce.col = GetESPColor(col, espColorMode);
+            if (isTeammate)
+                ce.col = RGB(50,150,255);
+            else
+                ce.col = GetESPColor(col, espColorMode);
 
             // copiar datos de huesos del snapshot anterior
             for (auto& old : oldSnap) {
@@ -1234,6 +1353,35 @@ static void ESPScanThread() {
             // posiciones frescas se leen en el render
             newCache.push_back(std::move(ce));
         }
+
+        // Segunda pasada: recuperar del cache anterior jugadores cuyo personaje
+        // se descargó (StreamingEnabled) pero siguen en el servidor
+        for (auto& old : oldSnap) {
+            if (old.name.empty()) continue;
+            if (old.pos.x == 0.f && old.pos.y == 0.f && old.pos.z == 0.f) continue;
+            bool inNew = false;
+            for (auto& nc : newCache)
+                if (nc.name == old.name) { inNew = true; break; }
+            if (inNew) continue;
+            bool wasFailed = false;
+            for (auto& fn : failedNames)
+                if (fn == old.name) { wasFailed = true; break; }
+            if (!wasFailed) continue;
+            DWORD staleDuration = now - old.lastPosChange;
+            if (staleDuration > 60000) continue;
+            newCache.push_back(old);
+            dbgRecovered++;
+        }
+
+        if (doScanDbg) {
+            FILE* df = fopen("ceitus_debug.log", "a");
+            if (df) {
+                fprintf(df, "[SCAN] total=%d invalid=%d teamSkip=%d recovered=%d cached=%d multiTeam=%d\n",
+                    dbgTotal, dbgInvalid, dbgTeamSkip, dbgRecovered, (int)newCache.size(), (int)multiTeam);
+                fclose(df);
+            }
+        }
+
         // detectar hits y kills comparando health con snapshot anterior
         if (bHitmarker || bKillfeed) {
             DWORD nowHK = GetTickCount();
@@ -1487,8 +1635,10 @@ static void LoadConfig(int mode = -1) {
     if (!f.eof()) { int k; f >> k; if (k >= 0x08 && k < 0xFE) flyUpKey = k; }
     if (!f.eof()) { int k; f >> k; if (k >= 0x08 && k < 0xFE) flyDownKey = k; }
     // clamp para evitar valores absurdos de configs viejas
-    if (fAimMaxDist < 1.f) fAimMaxDist = 200.f;
-    if (fAimFov > 300.f || fAimFov < 5.f) fAimFov = 80.f;
+    // bump: configs viejos quedaron con 200 studs → aimbot nunca engancha a lejanos
+    if (fAimMaxDist < 10000.f) fAimMaxDist = 10000000.f;
+    if (fAimFov < 5.f)  fAimFov = 80.f;
+    if (fAimFov > 500.f) fAimFov = 500.f;
     if (fAimSmooth > 100.f || fAimSmooth < 0.1f) fAimSmooth = 60.f;
 }
 
@@ -1709,19 +1859,22 @@ int main() {
 
             for (auto& ce : snap) {
                 // salud fresca desde Humanoid cacheado — sin delay de scan
-                if (bHealthBar && ce.humanoid > 0x10000000000ULL) {
+                if (bHealthBar && ce.humanoid) {
                     float fh = mem.Read<float>(ce.humanoid + Offsets::Humanoid::Health);
                     if (fh > 0.f && fh <= 10000.f) ce.health = fh;
                     float fm = mem.Read<float>(ce.humanoid + Offsets::Humanoid::MaxHealth);
                     if (fm > 0.f && fm <= 10000.f) ce.maxHealth = fm;
                 }
-                // posición fresca desde HRP cacheado — 2 RPM rápidos, sin FindFirstChild
+                // posición fresca desde HRP cacheado (solo si no es muy stale)
+                DWORD nowR = GetTickCount();
+                DWORD staleMs = nowR - ce.lastPosChange;
                 Vector3 pos = ce.pos;
-                if (ce.hrp) {
+                if (ce.hrp && staleMs < 2000) {
                     uintptr_t prim = mem.Read<uintptr_t>(ce.hrp + Offsets::BasePart::Primitive);
-                    if (prim > 0x10000000000ULL) {
+                    if (prim) {
                         Vector3 fp = mem.Read<Vector3>(prim + Offsets::Primitive::Position);
-                        if (fabsf(fp.y) < 100000.f) pos = fp;
+                        if (fabsf(fp.y) < 100000.f && (fp.x != 0.f || fp.y != 0.f || fp.z != 0.f))
+                            pos = fp;
                     }
                 }
                 Vector3 headPos = pos; headPos.y += 3.0f;
@@ -1742,19 +1895,35 @@ int main() {
                 bool headFront = WorldToScreen(vm, headPos, headSc, sw, sh);
                 bool feetFront = WorldToScreen(vm, feetPos, feetSc, sw, sh);
                 WorldToScreen(vm, pos, centerSc, sw, sh);
+
+                // debug render: cada 2s loguear TODOS los jugadores
+                {
+                    static DWORD lastRenderDbg = 0;
+                    DWORD nowRD = GetTickCount();
+                    if (nowRD - lastRenderDbg > 2000) {
+                        if (dbgValid == 1) lastRenderDbg = nowRD;
+                        FILE* df = fopen("ceitus_debug.log", "a");
+                        if (df) {
+                            fprintf(df, "[RENDER] %s pos=%.1f,%.1f,%.1f scr=%.0f,%.0f front=%d%d stale=%lums hp=%.0f col=%06X\n",
+                                ce.name.c_str(), pos.x, pos.y, pos.z,
+                                centerSc.x, centerSc.y,
+                                (int)headFront, (int)feetFront,
+                                (unsigned long)staleMs, ce.health,
+                                (unsigned int)ce.col);
+                            fclose(df);
+                        }
+                    }
+                }
+
                 if (!headFront && !feetFront) continue;
 
 
                 if (bSkeleton) {
-                    // leer posiciones frescas usando bonePtrs
                     for (int bi = 0; bi < 21; bi++) {
                         if (ce.boneOk[bi] && ce.bonePtrs[bi]) {
                             Vector3 bp = GetPartPosition(ce.bonePtrs[bi]);
-                            // solo filtrar posición nula (BoneLine también lo hace, doble seguridad)
                             if (!(bp.x==0.f && bp.y==0.f && bp.z==0.f))
                                 ce.bones[bi] = bp;
-                            else
-                                ce.bones[bi] = ce.bones[bi]; // mantener último valor válido
                         }
                     }
                     // --- stickman style ---
@@ -1825,31 +1994,19 @@ int main() {
                         if (bChams) {
                             COLORREF bc = ce.col;
                             BYTE r = GetRValue(bc), g2 = GetGValue(bc), b2 = GetBValue(bc);
-                            // fill denso (cada 1px) con color oscuro
                             COLORREF darkFill = RGB(r/4, g2/4, b2/4);
-                            HPEN fp = GetCachedPen(darkFill, 1);
-                            HPEN oldPen = (HPEN)SelectObject(g_memDC, fp);
-                            for (float fy = tl.y + 1.f; fy < tl.y + visH - 1.f; fy += 1.f) {
-                                MoveToEx(g_memDC, (int)(tl.x+1), (int)fy, nullptr);
-                                LineTo(g_memDC, (int)(tl.x+boxW-1), (int)fy);
-                            }
-                            SelectObject(g_memDC, oldPen);
-                            // glow outlines: 4 capas (exterior oscuro → interior brillante)
-                            struct { int pad; int thick; COLORREF col; } layers[] = {
-                                { 6, 1, RGB(r/3, g2/3, b2/3) },
-                                { 4, 1, RGB(r/2, g2/2, b2/2) },
-                                { 2, 2, bc                    },
-                                { 0, 3, RGB(std::min(255,(int)r+80), std::min(255,(int)g2+80), std::min(255,(int)b2+80)) },
-                            };
+                            HBRUSH fillBr = CreateSolidBrush(darkFill);
+                            RECT fillRc = { (int)(tl.x+1), (int)(tl.y+1), (int)(tl.x+boxW-1), (int)(tl.y+visH-1) };
+                            FillRect(g_memDC, &fillRc, fillBr);
+                            DeleteObject(fillBr);
                             HBRUSH oldBr = (HBRUSH)SelectObject(g_memDC, GetStockObject(NULL_BRUSH));
-                            for (auto& lay : layers) {
-                                HPEN lp = GetCachedPen(lay.col, lay.thick);
-                                oldPen = (HPEN)SelectObject(g_memDC, lp);
-                                ::Rectangle(g_memDC,
-                                    (int)(tl.x-lay.pad), (int)(tl.y-lay.pad),
-                                    (int)(tl.x+boxW+lay.pad), (int)(tl.y+visH+lay.pad));
-                                SelectObject(g_memDC, oldPen);
-                            }
+                            HPEN lp1 = GetCachedPen(RGB(r/2, g2/2, b2/2), 1);
+                            HPEN oldPen = (HPEN)SelectObject(g_memDC, lp1);
+                            ::Rectangle(g_memDC, (int)(tl.x-4), (int)(tl.y-4), (int)(tl.x+boxW+4), (int)(tl.y+visH+4));
+                            HPEN lp2 = GetCachedPen(RGB(std::min(255,(int)r+80), std::min(255,(int)g2+80), std::min(255,(int)b2+80)), 2);
+                            SelectObject(g_memDC, lp2);
+                            ::Rectangle(g_memDC, (int)(tl.x), (int)(tl.y), (int)(tl.x+boxW), (int)(tl.y+visH));
+                            SelectObject(g_memDC, oldPen);
                             SelectObject(g_memDC, oldBr);
                         }
                         if (bBoxes) {
@@ -2447,29 +2604,45 @@ int main() {
         ImGui::SetCursorPosY(24);
         ImGui::TextColored(ImVec4(0.35f,0.40f,0.58f,1.f), "v" CEITUS_VERSION);
 
-        // status pill
+        // status pill — 4 estados: sin Roblox / sin DM / sin players / OK
         {
-            bool attached = (mem.proc != nullptr); // conectado si tenemos handle a Roblox
-            // pill background
+            bool hasProc    = (mem.proc != nullptr);
+            bool hasDM      = hasProc && (dbgDM != 0);
+            bool hasPlayers = hasDM   && (dbgPlayers > 0);
+            bool attached   = hasProc; // alias para boton Conectar abajo
+
+            // 0=rojo (sin proc), 1=amarillo (sin DM), 2=naranja (sin players), 3=verde (OK)
+            int state = hasPlayers ? 3 : (hasDM ? 2 : (hasProc ? 1 : 0));
+            const char* labels[4] = { "Sin Roblox", "DM Fallo", "Sin players", "Conectado" };
+            ImU32 bgCols[4]  = { IM_COL32(55,20,20,200), IM_COL32(60,55,15,200),
+                                 IM_COL32(70,45,15,200), IM_COL32(20,55,30,200) };
+            ImU32 brdCols[4] = { IM_COL32(180,40,40,120), IM_COL32(200,180,40,140),
+                                 IM_COL32(220,140,40,140), IM_COL32(40,180,80,120) };
+            ImU32 dotCols[4] = { IM_COL32(220,60,60,255), IM_COL32(230,210,70,255),
+                                 IM_COL32(240,160,60,255), IM_COL32(50,220,100,255) };
+            ImU32 txtCols[4] = { IM_COL32(220,90,90,230), IM_COL32(230,210,100,230),
+                                 IM_COL32(240,170,90,230), IM_COL32(80,220,120,230) };
+
             ImVec2 pb = {wp.x + ws.x - 220, wp.y + 20};
             ImVec2 pe = {pb.x + 112,          pb.y + 22};
-            dl->AddRectFilled(pb, pe,
-                attached ? IM_COL32(20,55,30,200) : IM_COL32(55,20,20,200), 11.f);
-            dl->AddRect(pb, pe,
-                attached ? IM_COL32(40,180,80,120) : IM_COL32(180,40,40,120), 11.f);
+            dl->AddRectFilled(pb, pe, bgCols[state], 11.f);
+            dl->AddRect     (pb, pe, brdCols[state], 11.f);
             // dot
             ImVec2 dot = {pb.x + 14, pb.y + 11};
-            dl->AddCircleFilled(dot, 4.5f, attached ? IM_COL32(50,220,100,255) : IM_COL32(220,60,60,255));
+            dl->AddCircleFilled(dot, 4.5f, dotCols[state]);
             // text
             ImVec2 tp = {pb.x + 24, pb.y + 4};
-            dl->AddText(tp, attached ? IM_COL32(80,220,120,230) : IM_COL32(220,90,90,230),
-                attached ? "Conectado" : "Sin Roblox");
+            dl->AddText(tp, txtCols[state], labels[state]);
 
-            // player count badge (if attached)
-            if (attached && dbgPlayers > 0) {
-                char pc[16]; snprintf(pc, sizeof(pc), "%d jugadores", dbgPlayers);
+            // detalle debajo del pill
+            {
+                char line[64];
+                if (hasPlayers)       snprintf(line, sizeof(line), "%d jugadores", dbgPlayers);
+                else if (hasDM)       snprintf(line, sizeof(line), "DM OK  jugadores: 0");
+                else if (hasProc)     snprintf(line, sizeof(line), "proc OK  DM=0 (offsets?)");
+                else                  snprintf(line, sizeof(line), "Roblox no corriendo");
                 ImVec2 pp = {wp.x + ws.x - 220, wp.y + 48};
-                dl->AddText(pp, IM_COL32(80,100,150,180), pc);
+                dl->AddText(pp, IM_COL32(100,120,170,200), line);
             }
 
             // boton Conectar cuando no está adjunto
@@ -2638,7 +2811,7 @@ int main() {
                 if (bAimbot) {
                     ImGui::Indent(12.f);
                     ImGui::SetNextItemWidth(200.f);
-                    ImGui::SliderFloat("FOV px",       &fAimFov,      30.f, 400.f, "%.0f");
+                    ImGui::SliderFloat("FOV px",       &fAimFov,      10.f, 500.f, "%.0f");
                     ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Dist max (m)", &fAimMaxDist,  30.f, 1000000.f, "%.0f", ImGuiSliderFlags_Logarithmic);
                     ImGui::SetNextItemWidth(200.f);
