@@ -32,7 +32,7 @@
 #include <mutex>
 
 // ---- versión actual ----
-#define CEITUS_VERSION "1.0.5"
+#define CEITUS_VERSION "1.1.1"
 
 // ---- URLs GitHub (reemplazar USER/REPO con tu repo real) ----
 #define GITHUB_USER      "ceitooo"
@@ -3030,7 +3030,7 @@ int main() {
                 ImGui::Spacing();
                 ImGui::TextColored(ImVec4(0.45f,0.50f,0.65f,1.f), "Version: " CEITUS_VERSION);
 
-                if (g_updateAvailable && g_canUpdate) {
+                if (g_updateAvailable) {
                     ImGui::Spacing();
                     ImGui::PushStyleColor(ImGuiCol_Button,       ImVec4(0.15f,0.50f,0.25f,1.f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f,0.60f,0.35f,1.f));
@@ -3140,12 +3140,9 @@ int main() {
         ImGui::EndChild();
         ImGui::End();
 
-        // popup de actualización disponible (solo para keys con canUpdate:true)
-        if (g_showUpdatePopup && g_canUpdate) {
+        if (g_showUpdatePopup) {
             ImGui::OpenPopup("##updatepopup");
             g_showUpdatePopup = false;
-        } else if (g_showUpdatePopup) {
-            g_showUpdatePopup = false; // descartar silenciosamente para keys normales
         }
         if (ImGui::BeginPopupModal("##updatepopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
             ImGui::Spacing();

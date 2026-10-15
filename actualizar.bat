@@ -12,7 +12,7 @@ echo [1/3] Descargando offsets nuevos...
 node autodump.js
 if errorlevel 2 (
     echo.
-    echo ERROR: Un pointer critico no se actualizo — recompilar seria inutil.
+    echo ERROR: Un pointer critico no se actualizo -- recompilar seria inutil.
     echo        Revisa el resumen de arriba.
     pause
     exit /b 2
@@ -25,7 +25,7 @@ if errorlevel 1 (
 
 echo.
 echo [2/3] Compilando...
-"C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe" "RbxESP\RbxESP\RbxESP.vcxproj" /p:Configuration=Release /p:Platform=x64 /v:minimal
+"C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe" "RbxESP\RbxESP\RbxESP.vcxproj" /p:Configuration=Release /p:Platform=x64 /t:Rebuild /v:minimal
 if errorlevel 1 (
     echo ERROR: No compilo
     pause
