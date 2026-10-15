@@ -635,7 +635,7 @@ static void AimbotThread() {
     DWORD lastTriggerFire = 0;
 
     while (true) {
-        Sleep(8);
+        Sleep(4); // 250Hz — tracking fluido, pegado al target
 
         // ---- bunny hop: envía espacio al window de Roblox en el momento de tocar el suelo ----
         if (bBhop && (GetAsyncKeyState(VK_SPACE) & 0x8000)) {
@@ -725,7 +725,9 @@ static void AimbotThread() {
                         if (WorldToScreen(vm, hw, hs, sw, sh)) {
                             float dx2 = hs.x - cx, dy2 = hs.y - cy;
                             float screenDist2 = sqrtf(dx2*dx2 + dy2*dy2);
-                            if (screenDist2 < fAimFov) { // soltar si sale del FOV
+                            // Histéresis: aguantar 1.6x el FOV antes de soltar.
+                            // Evita que el target se escape por 1 frame y hop a otro.
+                            if (screenDist2 < fAimFov * 1.6f) {
                                 cachedDist = (dist3d >= 0.f) ? dist3d : screenDist2;
                                 targetValid = true;
                             }
@@ -736,14 +738,18 @@ static void AimbotThread() {
         }
 
         // --- scan: buscar mejor target ---
-        if (now - lastScanTime > 100 || !targetValid) {
+        // Si ya hay target válido, re-scan solo cada 300ms (sticky).
+        // Si no hay, scan rápido para enganchar algo.
+        int scanInterval = targetValid ? 300 : 50;
+        if (now - lastScanTime > scanInterval) {
             uintptr_t dm = GetDataModel();
             uintptr_t ps = dm ? GetPlayersService(dm) : 0;
             if (!ps && lastPs) { auto t = GetAllPlayers(lastPs); if (!t.empty()) ps = lastPs; }
             uintptr_t lp = ps ? GetLocalPlayer(ps) : 0;
             uintptr_t localTeam = lp ? mem.Read<uintptr_t>(lp + Offsets::Player::Team) : 0;
 
-            float bestDist = targetValid ? cachedDist * 0.75f : 99999.f;
+            // Robar target sólo si está mucho más cerca (40% del actual) → evita hop entre vecinos
+            float bestDist = targetValid ? cachedDist * 0.40f : 99999.f;
             uintptr_t newPlayer = 0, newHP = 0, newHRP = 0;
 
             if (ps) {
@@ -888,20 +894,17 @@ static void AimbotThread() {
         // ---- aimbot ----
         bool keyHeld = bAimbot && aimbotKey && (GetAsyncKeyState(aimbotKey) & 0x8000);
         static float accumX = 0.f, accumY = 0.f;
-        static bool  skipNext = false; // espera 1 ciclo tras enviar para que la cámara actualice
         if (!keyHeld) {
-            accumX = 0.f; accumY = 0.f; skipNext = false;
+            accumX = 0.f; accumY = 0.f;
         }
         if (keyHeld) {
-            if (dist < 1.5f) { accumX = 0.f; accumY = 0.f; skipNext = false; continue; }
+            if (dist < 0.5f) { accumX = 0.f; accumY = 0.f; continue; }
 
-            // skipNext: evita acumular doble movimiento antes de que Roblox actualice la cámara
-            if (skipNext) { skipNext = false; continue; }
-
-            // 60% = ~80ms para 100px, 100% = snap instantáneo
+            // smoothness normalizada: a 250Hz, gain = fAimSmooth/100 por tick se siente natural.
+            // 100% = snap instantáneo (en 1 tick), 1% = ~400ms para cubrir distancia.
             float gain = std::clamp(fAimSmooth / 100.f, 0.005f, 1.0f);
 
-            // nunca mover más que la distancia restante (sin overshoot)
+            // nunca mover más que la distancia restante (sin overshoot cuando la cámara no updateó aún)
             float moveX = dx * gain;
             float moveY = dy * gain;
             if (fabsf(moveX) > fabsf(dx)) moveX = dx;
@@ -942,7 +945,8 @@ static void AimbotThread() {
                     inp.mi.dwFlags = MOUSEEVENTF_MOVE;
                     inp.mi.dx = mx; inp.mi.dy = my;
                     SendInput(1, &inp, sizeof(INPUT));
-                    skipNext = true; // dar 8ms para que Roblox procese el input
+                    // NO skipNext: el clamp arriba limita cada move a `dx` restante,
+                    // así que aunque la cámara no haya updateado, no overshoot.
                 }
             }
         }
@@ -2813,7 +2817,7 @@ int main() {
                     ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("FOV px",       &fAimFov,      10.f, 500.f, "%.0f");
                     ImGui::SetNextItemWidth(200.f);
-                    ImGui::SliderFloat("Dist max (m)", &fAimMaxDist,  30.f, 1000000.f, "%.0f", ImGuiSliderFlags_Logarithmic);
+                    ImGui::SliderFloat("Dist max (m)", &fAimMaxDist,  30.f, 100000000.f, "%.0f", ImGuiSliderFlags_Logarithmic);
                     ImGui::SetNextItemWidth(200.f);
                     ImGui::SliderFloat("Velocidad",    &fAimSmooth,    1.f,  100.f, "%.0f%%");
                     static const char* aimBoneNames[] = { "Cabeza", "Cuello", "Pecho" };
