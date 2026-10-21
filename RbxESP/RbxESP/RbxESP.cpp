@@ -32,7 +32,7 @@
 #include <mutex>
 
 // ---- versión actual ----
-#define CEITUS_VERSION "1.1.1"
+#define CEITUS_VERSION "1.1.2"
 
 // ---- URLs GitHub (reemplazar USER/REPO con tu repo real) ----
 #define GITHUB_USER      "ceitooo"

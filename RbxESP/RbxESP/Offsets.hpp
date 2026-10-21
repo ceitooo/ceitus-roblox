@@ -1,5 +1,5 @@
-/*  Roblox Version  : version-7a0c6d10fcb34a2c
-/*  Updated At      : 14/10/2026
+/*  Roblox Version  : version-11f155f3450f4c8e
+/*  Updated At      : 21/10/2026
 /*  Source          : theo's offsets dump (merged with legacy entries)
 */
 
@@ -8,7 +8,7 @@
 #include <string>
 
 namespace Offsets {
-    inline std::string ClientVersion = "version-7a0c6d10fcb34a2c";
+    inline std::string ClientVersion = "version-11f155f3450f4c8e";
 
     namespace Adornment {
         inline uintptr_t Adornee       = 0xb8;
@@ -62,7 +62,7 @@ namespace Offsets {
 
     namespace BasePart {
         inline uintptr_t CastShadow   = 0x128;
-        inline uintptr_t Color3       = 0x1ac;
+        inline uintptr_t Color3       = 0x39;
         inline uintptr_t Locked       = 0x129;
         inline uintptr_t Massless     = 0x12a;
         inline uintptr_t Primitive    = 0x180;
@@ -105,7 +105,7 @@ namespace Offsets {
     }
 
     namespace CachedItem {
-        inline uintptr_t FileMeshData = 0x28;
+        inline uintptr_t FileMeshData = 0x40;
     }
 
     namespace Camera {
@@ -210,7 +210,7 @@ namespace Offsets {
     }
 
     namespace FakeDataModel {
-        inline uintptr_t Pointer       = 0x8dc5d00; // version-cec3ad5889b447cf
+        inline uintptr_t Pointer       = 0x8dc8000;
         inline uintptr_t RealDataModel = 0x1f8;
     }
 
@@ -338,7 +338,7 @@ namespace Offsets {
         inline uintptr_t AutoJumpEnabled         = 0x1d0;
         inline uintptr_t AutoRotate              = 0x1d1;
         inline uintptr_t AutomaticScalingEnabled = 0x1d2;
-        inline uintptr_t BreakJointsOnDeath      = 0x1d3;
+        inline uintptr_t BreakJointsOnDeath      = 0xd5;
         inline uintptr_t CameraOffset            = 0x118;
         inline uintptr_t DisplayDistanceType     = 0x17c;
         inline uintptr_t DisplayName             = 0xa8;
@@ -461,7 +461,7 @@ namespace Offsets {
     }
 
     namespace LruNode {
-        inline uintptr_t CachedItem = 0x38;
+        inline uintptr_t CachedItem = 0x40;
         inline uintptr_t MeshId     = 0x10;
         inline uintptr_t Next       = 0x0;
             inline uintptr_t AssetID = 0x10;
@@ -846,7 +846,7 @@ namespace Offsets {
     }
 
     namespace RunService {
-        inline uintptr_t HeartbeatFPS  = 0xc0;
+        inline uintptr_t HeartbeatFPS  = 0xc8;
         inline uintptr_t HeartbeatTask = 0xe0;
     }
 
@@ -936,7 +936,7 @@ namespace Offsets {
         inline uintptr_t JobStart = 0xc8;
         inline uintptr_t MaxFPS   = 0xb0;
         inline uintptr_t MaxFps   = 0xb0;
-        inline uintptr_t Pointer  = 0x8d6f048;
+        inline uintptr_t Pointer  = 0x8d71348;
     }
 
     namespace Team {
@@ -1017,7 +1017,7 @@ namespace Offsets {
         inline uintptr_t GripPos              = 0x49c;
         inline uintptr_t GripRight            = 0x47c;
         inline uintptr_t GripUp               = 0x484;
-        inline uintptr_t ManualActivationOnly = 0x345;
+        inline uintptr_t ManualActivationOnly = 0x4aa;
         inline uintptr_t RequiresHandle       = 0x4ab;
         inline uintptr_t Tooltip              = 0x458;
         inline uintptr_t TextureId            = 0x350;
@@ -1047,7 +1047,7 @@ namespace Offsets {
     namespace VisualEngine {
         inline uintptr_t Dimensions    = 0xb10;
         inline uintptr_t FakeDataModel = 0xaf0;
-        inline uintptr_t Pointer       = 0x884a0b0; // version-cec3ad5889b447cf
+        inline uintptr_t Pointer       = 0x884c2e0;
         inline uintptr_t RenderView    = 0xc38;
         inline uintptr_t ViewMatrix    = 0x1b0;
     }
